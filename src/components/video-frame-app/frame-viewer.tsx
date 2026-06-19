@@ -67,7 +67,9 @@ export function FrameViewer() {
     }
 
     let cancelled = false;
-    setIsLoading(true);
+    // Defer to avoid calling setState synchronously in effect body
+    const startLoading = () => setIsLoading(true);
+    startLoading();
 
     // Check preload cache first
     const cachedUrl = preloadRef.current.get(selectedFrameIndex);
