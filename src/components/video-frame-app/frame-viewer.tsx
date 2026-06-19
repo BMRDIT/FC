@@ -4,11 +4,6 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useVideoStore } from "@/store/video-store";
 import { getFrame } from "@/lib/frame-db";
 import { formatTimestamp } from "@/lib/frame-extractor";
-import {
-  SafmnEngine,
-  isWebGPUSupported,
-  computeTileGrid,
-} from "@/lib/safmn-engine";
 import { cn } from "@/lib/utils";
 import {
   ChevronLeft,
@@ -30,9 +25,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 
-/** Path to the SAFMN ONNX model — served from the public directory. */
-const MODEL_PATH = "/models/safmn_4x.onnx";
-
 export function FrameViewer() {
   const {
     selectedFrameIndex,
@@ -44,12 +36,22 @@ export function FrameViewer() {
     resetViewerZoom,
     videoWidth,
     videoHeight,
-    videoDuration,
-    videoFps,
     goNextFrame,
     goPrevFrame,
     goFirstFrame,
     goLastFrame,
+    // Upscale state from store (driven by timeline enhance buttons)
+    upscaleStatusMap,
+    upscalingFrameIndex,
+    upscaleProgress,
+    upscaleTileInfo,
+    upscaledImageUrl,
+    upscaledImageFrameIndex,
+    upscaleError,
+    showUpscaledOverlay,
+    setShowUpscaledOverlay,
+    setUpscaleError,
+    clearAllUpscale,
   } = useVideoStore();
 
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
@@ -59,21 +61,16 @@ export function FrameViewer() {
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // ─── Upscale state ──────────────────────────────────────────────────────
-  const [upscaledUrl, setUpscaledUrl] = useState<string | null>(null);
-  const [isUpscaling, setIsUpscaling] = useState(false);
-  const [upscaleProgress, setUpscaleProgress] = useState(0);
-  const [upscaleTileInfo, setUpscaleTileInfo] = useState<string>("");
-  const [upscaleError, setUpscaleError] = useState<string | null>(null);
-  const [showUpscaled, setShowUpscaled] = useState(false);
-
-  const engineRef = useRef<SafmnEngine | null>(null);
-  const upscaledUrlRef = useRef<string | null>(null);
-
   // Preload adjacent frames
   const preloadRef = useRef<Map<number, string>>(new Map());
 
   const sessionId = currentSession?.id || "";
+
+  // The upscaled image belongs to the currently selected frame
+  const hasUpscaledForCurrentFrame =
+    upscaledImageUrl && upscaledImageFrameIndex === selectedFrameIndex;
+  const currentFrameUpscaleStatus = upscaleStatusMap[selectedFrameIndex] || "idle";
+  const isCurrentFrameUpscaling = upscalingFrameIndex === selectedFrameIndex;
 
   // Cleanup function for URLs
   const cleanupUrl = useCallback(() => {
@@ -83,23 +80,12 @@ export function FrameViewer() {
     }
   }, []);
 
-  // Cleanup upscaled URL
-  const cleanupUpscaledUrl = useCallback(() => {
-    if (upscaledUrlRef.current) {
-      URL.revokeObjectURL(upscaledUrlRef.current);
-      upscaledUrlRef.current = null;
-    }
-  }, []);
-
-  // Clear upscale state when frame changes
+  // Hide overlay when switching frames (unless the new frame also has an upscaled result)
   useEffect(() => {
-    cleanupUpscaledUrl();
-    setUpscaledUrl(null);
-    setShowUpscaled(false);
-    setUpscaleError(null);
-    setUpscaleProgress(0);
-    setUpscaleTileInfo("");
-  }, [selectedFrameIndex, cleanupUpscaledUrl]);
+    if (upscaledImageFrameIndex !== null && upscaledImageFrameIndex !== selectedFrameIndex) {
+      setShowUpscaledOverlay(false);
+    }
+  }, [selectedFrameIndex, upscaledImageFrameIndex, setShowUpscaledOverlay]);
 
   // Load frame when selection changes
   useEffect(() => {
@@ -108,7 +94,6 @@ export function FrameViewer() {
     }
 
     let cancelled = false;
-    // Defer to avoid calling setState synchronously in effect body
     const startLoading = () => setIsLoading(true);
     startLoading();
 
@@ -129,7 +114,7 @@ export function FrameViewer() {
             preloadRef.current.set(selectedFrameIndex, url);
           }
 
-          // Preload next 2 frames
+          // Preload next 3 frames
           const preloadNext = async () => {
             for (let offset = 1; offset <= 3; offset++) {
               const preloadIdx = selectedFrameIndex + offset;
@@ -182,24 +167,19 @@ export function FrameViewer() {
   useEffect(() => {
     return () => {
       cleanupUrl();
-      cleanupUpscaledUrl();
       for (const [, url] of preloadRef.current) {
         URL.revokeObjectURL(url);
       }
       preloadRef.current.clear();
-      if (engineRef.current) {
-        engineRef.current.dispose().catch(() => {});
-        engineRef.current = null;
-      }
+      clearAllUpscale();
     };
-  }, [cleanupUrl, cleanupUpscaledUrl]);
+  }, [cleanupUrl, clearAllUpscale]);
 
   // Keyboard navigation
   useEffect(() => {
     if (extractionStatus !== "completed") return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't intercept when user is in an input
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement
@@ -242,12 +222,29 @@ export function FrameViewer() {
           e.preventDefault();
           resetViewerZoom();
           break;
+        case "Escape":
+          if (showUpscaledOverlay) {
+            e.preventDefault();
+            setShowUpscaledOverlay(false);
+          }
+          break;
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [extractionStatus, goNextFrame, goPrevFrame, goFirstFrame, goLastFrame, viewerZoom, setViewerZoom, resetViewerZoom]);
+  }, [
+    extractionStatus,
+    goNextFrame,
+    goPrevFrame,
+    goFirstFrame,
+    goLastFrame,
+    viewerZoom,
+    setViewerZoom,
+    resetViewerZoom,
+    showUpscaledOverlay,
+    setShowUpscaledOverlay,
+  ]);
 
   // Fullscreen toggle
   const toggleFullscreen = useCallback(() => {
@@ -260,144 +257,38 @@ export function FrameViewer() {
     }
   }, []);
 
-  // Listen for fullscreen changes
   useEffect(() => {
     const handler = () => setIsFullscreen(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", handler);
     return () => document.removeEventListener("fullscreenchange", handler);
   }, []);
 
-  // ─── Upscale handler ────────────────────────────────────────────────────
-
-  /**
-   * Upscale the currently selected frame using the SAFMN WebGPU engine.
-   *
-   * Flow:
-   *   1. Check WebGPU support.
-   *   2. Initialize engine (lazy — only on first call).
-   *   3. Load the frame blob into an offscreen canvas at native resolution.
-   *   4. Run engine.upscale() with progress callbacks.
-   *   5. Convert the output canvas to a blob URL and display it as an overlay.
-   */
-  const handleUpscaleFrame = useCallback(async () => {
-    if (!sessionId || isUpscaling) return;
-
-    // Clear previous upscale results for this frame
-    cleanupUpscaledUrl();
-    setUpscaledUrl(null);
-    setShowUpscaled(false);
-    setUpscaleError(null);
-    setUpscaleProgress(0);
-    setUpscaleTileInfo("");
-
-    // Check WebGPU support
-    if (!isWebGPUSupported()) {
-      setUpscaleError(
-        "WebGPU is not supported in this browser. Please use a recent version of Chrome or Edge.",
-      );
-      return;
-    }
-
-    setIsUpscaling(true);
-
-    try {
-      // Initialize engine (lazy — reuse if already loaded)
-      if (!engineRef.current?.isReady()) {
-        if (engineRef.current) {
-          await engineRef.current.dispose();
-          engineRef.current = null;
-        }
-        const engine = new SafmnEngine({ modelPath: MODEL_PATH });
-        await engine.init();
-        engineRef.current = engine;
-      }
-
-      // Load the current frame blob into an offscreen canvas
-      const frame = await getFrame(sessionId, selectedFrameIndex);
-      if (!frame) {
-        throw new Error("Failed to load frame from storage.");
-      }
-
-      const bitmap = await createImageBitmap(frame.blob);
-      const sourceCanvas = document.createElement("canvas");
-      sourceCanvas.width = bitmap.width;
-      sourceCanvas.height = bitmap.height;
-      const ctx = sourceCanvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) throw new Error("Failed to get 2D canvas context.");
-      ctx.drawImage(bitmap, 0, 0);
-      bitmap.close();
-
-      // Pre-compute tile grid for progress display
-      const tiles = computeTileGrid(sourceCanvas.width, sourceCanvas.height);
-
-      // Run the upscale pipeline
-      await engineRef.current.upscale(sourceCanvas, {
-        onProgress: (tileIndex, total) => {
-          setUpscaleProgress((tileIndex / total) * 100);
-          setUpscaleTileInfo(`Tile ${tileIndex} of ${total}`);
-        },
-        onStatusChange: (status) => {
-          if (status === "stitching") {
-            setUpscaleTileInfo("Stitching tiles...");
-          }
-        },
-        onTileComplete: () => {},
-        onError: (err) => {
-          setUpscaleError(err);
-          setIsUpscaling(false);
-        },
-        onComplete: (outputCanvas) => {
-          // Convert output canvas to blob URL for display
-          outputCanvas.toBlob((blob) => {
-            if (blob) {
-              cleanupUpscaledUrl();
-              const url = URL.createObjectURL(blob);
-              upscaledUrlRef.current = url;
-              setUpscaledUrl(url);
-              setShowUpscaled(true);
-            }
-            setIsUpscaling(false);
-            setUpscaleProgress(100);
-            setUpscaleTileInfo("");
-          }, "image/png");
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (
-        msg.includes("Device Lost") ||
-        msg.includes("device was lost") ||
-        msg.includes("GPU")
-      ) {
-        setUpscaleError(
-          `WebGPU device error (${msg}). Your GPU may have run out of memory or the browser lost the device.`,
-        );
-      } else {
-        setUpscaleError(`Upscale failed: ${msg}`);
-      }
-      setIsUpscaling(false);
-    }
-  }, [sessionId, selectedFrameIndex, isUpscaling, cleanupUpscaledUrl]);
-
   // Download upscaled image
   const handleDownloadUpscaled = useCallback(() => {
-    if (!upscaledUrl) return;
+    if (!upscaledImageUrl) return;
     const link = document.createElement("a");
-    link.download = `upscaled_frame_${selectedFrameIndex + 1}.png`;
-    link.href = upscaledUrl;
+    link.download = `upscaled_frame_${(upscaledImageFrameIndex ?? 0) + 1}.png`;
+    link.href = upscaledImageUrl;
     link.click();
-  }, [upscaledUrl, selectedFrameIndex]);
+  }, [upscaledImageUrl, upscaledImageFrameIndex]);
 
   // Close upscaled overlay
   const handleCloseUpscaled = useCallback(() => {
-    setShowUpscaled(false);
-  }, []);
+    setShowUpscaledOverlay(false);
+  }, [setShowUpscaledOverlay]);
+
+  // Show upscaled overlay if available for current frame
+  const handleShowUpscaled = useCallback(() => {
+    if (hasUpscaledForCurrentFrame) {
+      setShowUpscaledOverlay(true);
+    }
+  }, [hasUpscaledForCurrentFrame, setShowUpscaledOverlay]);
 
   const timestamp = currentSession
     ? formatTimestamp(
         selectedFrameIndex / (currentSession.fps || 30),
         currentSession.fps || 30,
-        selectedFrameIndex
+        selectedFrameIndex,
       )
     : "";
 
@@ -417,7 +308,7 @@ export function FrameViewer() {
       ref={containerRef}
       className={cn(
         "relative flex flex-col flex-1 bg-black/95 min-h-[300px] lg:min-h-[400px]",
-        isFullscreen && "bg-black"
+        isFullscreen && "bg-black",
       )}
       role="region"
       aria-label="Frame viewer"
@@ -432,47 +323,37 @@ export function FrameViewer() {
             </span>
           )}
           {viewerZoom !== 1 && (
-            <span className="text-white/40">
-              {Math.round(viewerZoom * 100)}%
-            </span>
+            <span className="text-white/40">{Math.round(viewerZoom * 100)}%</span>
           )}
-          {showUpscaled && upscaledUrl && (
-            <span className="text-green-400 font-semibold">
-              ↑ UPSCALED 4×
-            </span>
+          {showUpscaledOverlay && hasUpscaledForCurrentFrame && (
+            <span className="text-green-400 font-semibold">↑ UPSCALED 4×</span>
           )}
         </div>
         <div className="flex items-center gap-1">
-          {/* Upscale button */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className={cn(
-              "h-7 px-2 text-xs gap-1.5 font-medium",
-              showUpscaled
-                ? "text-green-400 hover:text-green-300 hover:bg-green-500/10"
-                : "text-white/60 hover:text-white hover:bg-white/10",
-            )}
-            onClick={handleUpscaleFrame}
-            disabled={isUpscaling || !frameUrl}
-            aria-label="Upscale current frame 4× with SAFMN"
-            title="Upscale current frame 4× with SAFMN (WebGPU)"
-          >
-            {isUpscaling ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span className="hidden sm:inline">
-                  {upscaleTileInfo || "Upscaling..."}
-                </span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Upscale 4×</span>
-              </>
-            )}
-          </Button>
-          <div className="w-px h-4 bg-white/20 mx-1" />
+          {/* Show upscaled button — only visible when a result exists for this frame */}
+          {hasUpscaledForCurrentFrame && !showUpscaledOverlay && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs gap-1.5 font-medium text-green-400 hover:text-green-300 hover:bg-green-500/10"
+              onClick={handleShowUpscaled}
+              aria-label="Show upscaled result"
+              title="Show upscaled 4× result"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Show 4×</span>
+            </Button>
+          )}
+          {/* Upscaling indicator in toolbar */}
+          {isCurrentFrameUpscaling && (
+            <span className="flex items-center gap-1.5 text-xs text-green-400 px-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span className="hidden sm:inline">{upscaleTileInfo || "Upscaling..."}</span>
+            </span>
+          )}
+          {hasUpscaledForCurrentFrame && (showUpscaledOverlay || isCurrentFrameUpscaling) && (
+            <div className="w-px h-4 bg-white/20 mx-1" />
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -551,8 +432,8 @@ export function FrameViewer() {
           </div>
         )}
 
-        {/* ─── Upscaled image overlay ─────────────────────────────────────── */}
-        {showUpscaled && upscaledUrl && (
+        {/* ─── Upscaled image overlay (on top of the canvas) ─────────────────── */}
+        {showUpscaledOverlay && hasUpscaledForCurrentFrame && upscaledImageUrl && (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/90 backdrop-blur-sm">
             {/* Close button */}
             <Button
@@ -576,9 +457,9 @@ export function FrameViewer() {
               <span className="text-xs">Download</span>
             </Button>
 
-            {/* Upscaled image — displayed on top of the canvas */}
+            {/* Upscaled image — displayed on top of the frame canvas */}
             <img
-              src={upscaledUrl}
+              src={upscaledImageUrl}
               alt={`Upscaled frame ${selectedFrameIndex + 1}`}
               className="max-w-full max-h-full object-contain select-none"
               draggable={false}
@@ -589,13 +470,13 @@ export function FrameViewer() {
 
             {/* Info badge */}
             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-green-500/20 px-3 py-1 text-xs font-medium text-green-400 backdrop-blur-sm">
-              4× Super-Resolution • SAFMN • WebGPU
+              4× Super-Resolution • SAFMN • WebGPU • Frame {selectedFrameIndex + 1}
             </div>
           </div>
         )}
 
-        {/* ─── Upscaling progress overlay ────────────────────────────────── */}
-        {isUpscaling && (
+        {/* ─── Upscaling progress overlay ────────────────────────────────────── */}
+        {isCurrentFrameUpscaling && (
           <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-4 bg-black/85 backdrop-blur-sm">
             <Loader2 className="w-10 h-10 text-green-400 animate-spin" />
             <div className="text-center space-y-1">
@@ -619,8 +500,8 @@ export function FrameViewer() {
           </div>
         )}
 
-        {/* ─── Upscale error overlay ─────────────────────────────────────── */}
-        {upscaleError && !isUpscaling && (
+        {/* ─── Upscale error overlay ─────────────────────────────────────────── */}
+        {upscaleError && !isCurrentFrameUpscaling && (
           <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-20 max-w-md">
             <div className="flex items-center gap-2 rounded-lg bg-red-500/15 px-4 py-2 text-sm text-red-400 backdrop-blur-sm border border-red-500/20">
               <AlertCircle className="w-4 h-4 shrink-0" />
