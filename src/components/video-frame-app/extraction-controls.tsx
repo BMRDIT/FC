@@ -73,19 +73,29 @@ export function ExtractionControls() {
   // Detect metadata when video is set
   React.useEffect(() => {
     if (!videoFile) {
-      setMetadata(null);
+      // Defer to avoid calling setState synchronously in effect body
+      const clear = () => setMetadata(null);
+      clear();
       return;
     }
 
-    setLoadingMeta(true);
+    let cancelled = false;
+    const setMeta = () => setLoadingMeta(true);
+    setMeta();
     detectVideoMetadata(videoFile.file)
       .then((meta) => {
-        setMetadata(meta);
+        if (!cancelled) setMetadata(meta);
       })
       .catch((err) => {
         console.error("Metadata detection failed:", err);
       })
-      .finally(() => setLoadingMeta(false));
+      .finally(() => {
+        if (!cancelled) setLoadingMeta(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [videoFile]);
 
   const estimatedFrames = metadata
