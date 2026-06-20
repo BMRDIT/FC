@@ -1,7 +1,7 @@
 "use client";
 
-import { ImageUpscalerApp } from "@/components/image-upscaler/image-upscaler-app";
+import { VideoFrameApp } from "@/components/video-frame-app/video-frame-app";
 
 export default function Home() {
-  return <ImageUpscalerApp />;
+  return <VideoFrameApp />;
 }
