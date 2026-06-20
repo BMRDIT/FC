@@ -59,7 +59,6 @@ export function VideoFrameApp() {
   const {
     extractionStatus,
     currentSession,
-    showSessionList,
     setShowSessionList,
     savedSessions,
   } = useVideoStore();
@@ -68,7 +67,6 @@ export function VideoFrameApp() {
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="flex items-center justify-between px-4 lg:px-6 h-14">
           <div className="flex items-center gap-3">
@@ -86,7 +84,6 @@ export function VideoFrameApp() {
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Back to upload button in viewer mode */}
             {showViewer && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -103,7 +100,6 @@ export function VideoFrameApp() {
                 <TooltipContent>Upload a new video</TooltipContent>
               </Tooltip>
             )}
-            {/* Session history button */}
             {savedSessions.length > 0 && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -127,7 +123,6 @@ export function VideoFrameApp() {
               </Tooltip>
             )}
 
-            {/* Keyboard shortcuts help */}
             <Sheet>
               <SheetTrigger asChild>
                 <Button
@@ -171,10 +166,8 @@ export function VideoFrameApp() {
         </div>
       </header>
 
-      {/* Main content */}
       <main className="flex-1 flex flex-col">
         {!showViewer ? (
-          /* Upload & extraction view */
           <div className="flex-1 flex items-start justify-center p-4 lg:p-8">
             <div className="w-full max-w-2xl space-y-6">
               <div className="space-y-1.5">
@@ -187,18 +180,14 @@ export function VideoFrameApp() {
                 </p>
               </div>
 
-              {/* Upload area */}
               <VideoUpload />
 
-              {/* Extraction controls */}
               <ExtractionControls />
 
-              {/* Progress display */}
               <ExtractionProgress />
             </div>
           </div>
         ) : (
-          /* Frame viewer mode */
           <div className="flex-1 flex flex-col h-[calc(100vh-3.5rem)] lg:h-[calc(100vh-3.5rem)]">
             <FrameViewer />
             <FrameTimeline />
@@ -206,17 +195,15 @@ export function VideoFrameApp() {
         )}
       </main>
 
-      {/* Footer */}
       <footer className="mt-auto border-t bg-background">
         <div className="flex items-center justify-between px-4 lg:px-6 py-2 text-[11px] text-muted-foreground">
           <span>Frame Extractor • Client-side video processing</span>
           <div className="flex items-center gap-1">
-            <span className="hidden sm:inline">Built with Next.js • WebCodecs</span>
+            <span className="hidden sm:inline">Built with Next.js • WebGPU</span>
           </div>
         </div>
       </footer>
 
-      {/* Session list overlay */}
       <SessionList />
     </div>
   );

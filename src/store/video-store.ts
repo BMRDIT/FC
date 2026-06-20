@@ -5,9 +5,9 @@ export type ExtractionStatus =
   | "idle"
   | "loading"
   | "extracting"
-  | "paused"
   | "completed"
-  | "error";
+  | "error"
+  | "cancelled";
 
 export interface VideoFileInfo {
   file: File;
@@ -17,20 +17,26 @@ export interface VideoFileInfo {
   type: string;
 }
 
-// ─── Upscale state types ─────────────────────────────────────────────────────
+export type UpscaleStatus =
+  | "idle"
+  | "loading-model"
+  | "processing"
+  | "stitching"
+  | "completed"
+  | "error";
 
-/** Per-frame upscale status tracked in the store so timeline and viewer stay in sync. */
-export type UpscaleStatus = "idle" | "loading-model" | "processing" | "stitching" | "completed" | "error";
-
-/** Map of frameIndex → upscale status, so each thumbnail can show its own state. */
 export type UpscaleStatusMap = Record<number, UpscaleStatus>;
 
+function revokeIfObjectUrl(url: string | null | undefined): void {
+  if (url && url.startsWith("blob:")) {
+    URL.revokeObjectURL(url);
+  }
+}
+
 interface VideoStore {
-  // Upload state
   videoFile: VideoFileInfo | null;
   setVideoFile: (file: VideoFileInfo | null) => void;
 
-  // Extraction state
   extractionStatus: ExtractionStatus;
   setExtractionStatus: (status: ExtractionStatus) => void;
   extractionProgress: number;
@@ -45,12 +51,13 @@ interface VideoStore {
   setExtractionError: (error: string | null) => void;
   extractionMethod: "webcodecs" | "canvas" | "ffmpeg" | null;
   setExtractionMethod: (method: "webcodecs" | "canvas" | "ffmpeg" | null) => void;
+  extractionAbort: AbortController | null;
+  setExtractionAbort: (controller: AbortController | null) => void;
+  cancelExtraction: () => void;
 
-  // Current session
   currentSession: VideoSession | null;
   setCurrentSession: (session: VideoSession | null) => void;
 
-  // Frame navigation
   selectedFrameIndex: number;
   setSelectedFrameIndex: (index: number) => void;
   totalFrames: number;
@@ -64,62 +71,55 @@ interface VideoStore {
   videoFps: number;
   setVideoFps: (fps: number) => void;
 
-  // Session history
   savedSessions: VideoSession[];
   setSavedSessions: (sessions: VideoSession[]) => void;
   showSessionList: boolean;
   setShowSessionList: (show: boolean) => void;
 
-  // Viewer zoom
   viewerZoom: number;
   setViewerZoom: (zoom: number) => void;
   resetViewerZoom: () => void;
 
-  // Navigation helpers
   goNextFrame: () => void;
   goPrevFrame: () => void;
   goFirstFrame: () => void;
   goLastFrame: () => void;
   goToFrame: (index: number) => void;
 
-  // ─── Upscale state (shared between timeline & viewer) ────────────────────
-  /** Status per frame index — "idle" means not upscaled. */
   upscaleStatusMap: UpscaleStatusMap;
-  /** Set the upscale status for a specific frame. */
   setUpscaleStatus: (frameIndex: number, status: UpscaleStatus) => void;
-  /** The frame index currently being upscaled (null if none). */
   upscalingFrameIndex: number | null;
   setUpscalingFrameIndex: (index: number | null) => void;
-  /** Progress percentage for the current upscale operation. */
   upscaleProgress: number;
   setUpscaleProgress: (progress: number) => void;
-  /** Human-readable tile info string for the current upscale. */
   upscaleTileInfo: string;
   setUpscaleTileInfo: (info: string) => void;
-  /** The upscaled image data URL for the currently selected frame (null if none). */
   upscaledImageUrl: string | null;
   setUpscaledImageUrl: (url: string | null) => void;
-  /** The frame index that the current upscaledImageUrl belongs to. */
   upscaledImageFrameIndex: number | null;
   setUpscaledImageFrameIndex: (index: number | null) => void;
-  /** Error message from the last upscale attempt. */
   upscaleError: string | null;
   setUpscaleError: (error: string | null) => void;
-  /** Whether the upscaled overlay is visible in the viewer. */
   showUpscaledOverlay: boolean;
   setShowUpscaledOverlay: (show: boolean) => void;
-  /** Clear all upscale state for a specific frame. */
+  upscaleAbort: AbortController | null;
+  setUpscaleAbort: (controller: AbortController | null) => void;
+  cancelUpscale: () => void;
   clearUpscaleForFrame: (frameIndex: number) => void;
-  /** Clear all upscale state entirely. */
   clearAllUpscale: () => void;
 
-  // Reset
   resetAll: () => void;
 }
 
 export const useVideoStore = create<VideoStore>((set, get) => ({
   videoFile: null,
-  setVideoFile: (file) => set({ videoFile: file }),
+  setVideoFile: (file) => {
+    const prev = get().videoFile;
+    if (prev?.objectUrl && prev.objectUrl !== file?.objectUrl) {
+      revokeIfObjectUrl(prev.objectUrl);
+    }
+    set({ videoFile: file });
+  },
 
   extractionStatus: "idle",
   setExtractionStatus: (status) => set({ extractionStatus: status }),
@@ -135,6 +135,12 @@ export const useVideoStore = create<VideoStore>((set, get) => ({
   setExtractionError: (error) => set({ extractionError: error }),
   extractionMethod: null,
   setExtractionMethod: (method) => set({ extractionMethod: method }),
+  extractionAbort: null,
+  setExtractionAbort: (controller) => set({ extractionAbort: controller }),
+  cancelExtraction: () => {
+    get().extractionAbort?.abort();
+    set({ extractionAbort: null, extractionStatus: "cancelled" });
+  },
 
   currentSession: null,
   setCurrentSession: (session) => set({ currentSession: session }),
@@ -183,7 +189,6 @@ export const useVideoStore = create<VideoStore>((set, get) => ({
     set({ selectedFrameIndex: Math.max(0, Math.min(index, totalFrames - 1)) });
   },
 
-  // ─── Upscale state ────────────────────────────────────────────────────────
   upscaleStatusMap: {},
   setUpscaleStatus: (frameIndex, status) =>
     set((state) => ({
@@ -196,20 +201,42 @@ export const useVideoStore = create<VideoStore>((set, get) => ({
   upscaleTileInfo: "",
   setUpscaleTileInfo: (info) => set({ upscaleTileInfo: info }),
   upscaledImageUrl: null,
-  setUpscaledImageUrl: (url) => set({ upscaledImageUrl: url }),
+  setUpscaledImageUrl: (url) => {
+    const prev = get().upscaledImageUrl;
+    if (prev && prev !== url) revokeIfObjectUrl(prev);
+    set({ upscaledImageUrl: url });
+  },
   upscaledImageFrameIndex: null,
   setUpscaledImageFrameIndex: (index) => set({ upscaledImageFrameIndex: index }),
   upscaleError: null,
   setUpscaleError: (error) => set({ upscaleError: error }),
   showUpscaledOverlay: false,
   setShowUpscaledOverlay: (show) => set({ showUpscaledOverlay: show }),
+  upscaleAbort: null,
+  setUpscaleAbort: (controller) => set({ upscaleAbort: controller }),
+  cancelUpscale: () => {
+    const { upscaleAbort, upscalingFrameIndex } = get();
+    upscaleAbort?.abort();
+    set((state) => ({
+      upscaleAbort: null,
+      upscalingFrameIndex: null,
+      upscaleProgress: 0,
+      upscaleTileInfo: "",
+      upscaleStatusMap:
+        upscalingFrameIndex !== null
+          ? { ...state.upscaleStatusMap, [upscalingFrameIndex]: "idle" }
+          : state.upscaleStatusMap,
+    }));
+  },
   clearUpscaleForFrame: (frameIndex) =>
     set((state) => {
       const newMap = { ...state.upscaleStatusMap };
       delete newMap[frameIndex];
+      const clearingActive = state.upscaledImageFrameIndex === frameIndex;
+      if (clearingActive) revokeIfObjectUrl(state.upscaledImageUrl);
       return {
         upscaleStatusMap: newMap,
-        ...(state.upscaledImageFrameIndex === frameIndex
+        ...(clearingActive
           ? {
               upscaledImageUrl: null,
               upscaledImageFrameIndex: null,
@@ -219,40 +246,52 @@ export const useVideoStore = create<VideoStore>((set, get) => ({
       };
     }),
   clearAllUpscale: () =>
-    set({
-      upscaleStatusMap: {},
-      upscalingFrameIndex: null,
-      upscaleProgress: 0,
-      upscaleTileInfo: "",
-      upscaledImageUrl: null,
-      upscaledImageFrameIndex: null,
-      upscaleError: null,
-      showUpscaledOverlay: false,
+    set((state) => {
+      revokeIfObjectUrl(state.upscaledImageUrl);
+      return {
+        upscaleStatusMap: {},
+        upscalingFrameIndex: null,
+        upscaleProgress: 0,
+        upscaleTileInfo: "",
+        upscaledImageUrl: null,
+        upscaledImageFrameIndex: null,
+        upscaleError: null,
+        showUpscaledOverlay: false,
+      };
     }),
 
   resetAll: () =>
-    set({
-      videoFile: null,
-      extractionStatus: "idle",
-      extractionProgress: 0,
-      framesExtracted: 0,
-      estimatedTotalFrames: 0,
-      extractionStartTime: 0,
-      extractionError: null,
-      extractionMethod: null,
-      selectedFrameIndex: 0,
-      totalFrames: 0,
-      videoDuration: 0,
-      videoWidth: 0,
-      videoHeight: 0,
-      viewerZoom: 1,
-      upscaleStatusMap: {},
-      upscalingFrameIndex: null,
-      upscaleProgress: 0,
-      upscaleTileInfo: "",
-      upscaledImageUrl: null,
-      upscaledImageFrameIndex: null,
-      upscaleError: null,
-      showUpscaledOverlay: false,
+    set((state) => {
+      revokeIfObjectUrl(state.videoFile?.objectUrl);
+      revokeIfObjectUrl(state.upscaledImageUrl);
+      state.extractionAbort?.abort();
+      state.upscaleAbort?.abort();
+      return {
+        videoFile: null,
+        extractionStatus: "idle",
+        extractionProgress: 0,
+        framesExtracted: 0,
+        estimatedTotalFrames: 0,
+        extractionStartTime: 0,
+        extractionError: null,
+        extractionMethod: null,
+        extractionAbort: null,
+        currentSession: null,
+        selectedFrameIndex: 0,
+        totalFrames: 0,
+        videoDuration: 0,
+        videoWidth: 0,
+        videoHeight: 0,
+        viewerZoom: 1,
+        upscaleStatusMap: {},
+        upscalingFrameIndex: null,
+        upscaleProgress: 0,
+        upscaleTileInfo: "",
+        upscaledImageUrl: null,
+        upscaledImageFrameIndex: null,
+        upscaleError: null,
+        showUpscaledOverlay: false,
+        upscaleAbort: null,
+      };
     }),
 }));

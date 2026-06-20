@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useEffect } from "react";
+import React, { useCallback } from "react";
 import { useVideoStore } from "@/store/video-store";
-import { getAllSessions, deleteSession, getSession } from "@/lib/frame-db";
+import { getAllSessions, deleteSession } from "@/lib/frame-db";
 import { formatFileSize, formatDuration } from "@/lib/frame-extractor";
 import {
   History,
@@ -45,16 +45,15 @@ export function SessionList() {
     setExtractionStatus,
   } = useVideoStore();
 
-  const loadSessions = async () => {
+  const loadSessions = useCallback(async () => {
     try {
       const sessions = await getAllSessions();
       setSavedSessions(sessions);
     } catch (error) {
       console.error("Failed to load sessions:", error);
     }
-  };
+  }, [setSavedSessions]);
 
-  // Load sessions on mount
   React.useEffect(() => {
     loadSessions();
   }, [loadSessions]);
@@ -92,16 +91,13 @@ export function SessionList() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-16 pb-16 px-4">
-      {/* Backdrop */}
       <div
         className="absolute inset-0 bg-black/50 backdrop-blur-sm"
         onClick={() => setShowSessionList(false)}
         aria-hidden
       />
 
-      {/* Modal */}
       <div className="relative w-full max-w-lg bg-background rounded-xl border shadow-2xl overflow-hidden">
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b">
           <div className="flex items-center gap-2">
             <History className="w-5 h-5 text-muted-foreground" />
@@ -118,7 +114,6 @@ export function SessionList() {
           </Button>
         </div>
 
-        {/* Session list */}
         <ScrollArea className="max-h-[60vh]">
           {savedSessions.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center">
@@ -137,12 +132,10 @@ export function SessionList() {
                   key={session.id}
                   className="flex items-center gap-4 px-6 py-4 hover:bg-muted/50 transition-colors"
                 >
-                  {/* Session icon */}
                   <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
                     <Layers className="w-5 h-5 text-primary" />
                   </div>
 
-                  {/* Session info */}
                   <div className="flex-1 min-w-0 space-y-1">
                     <p className="text-sm font-medium truncate">
                       {session.fileName}
@@ -167,7 +160,6 @@ export function SessionList() {
                     </p>
                   </div>
 
-                  {/* Actions */}
                   <div className="flex items-center gap-1 shrink-0">
                     <Button
                       variant="outline"

@@ -19,7 +19,7 @@ export interface FrameData {
   id: string;
   sessionId: string;
   frameIndex: number;
-  timestamp: number; // in seconds
+  timestamp: number;
   width: number;
   height: number;
   blob: Blob;
@@ -53,38 +53,33 @@ class FrameDatabase extends Dexie {
 
 export const frameDb = new FrameDatabase();
 
-// Helper to generate a unique session ID
 export function generateSessionId(): string {
   return `session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 }
 
-// Get all saved sessions
 export async function getAllSessions(): Promise<VideoSession[]> {
   return frameDb.sessions.orderBy("createdAt").reverse().toArray();
 }
 
-// Get a session by ID
 export async function getSession(
   id: string
 ): Promise<VideoSession | undefined> {
   return frameDb.sessions.get(id);
 }
 
-// Get frames for a session, paginated
 export async function getFramesForSession(
   sessionId: string,
   offset: number = 0,
   limit: number = 100
 ): Promise<FrameData[]> {
   return frameDb.frames
-    .where("sessionId")
-    .equals(sessionId)
+    .where("[sessionId+frameIndex]")
+    .between([sessionId, Dexie.minKey], [sessionId, Dexie.maxKey])
     .offset(offset)
     .limit(limit)
     .toArray();
 }
 
-// Get a single frame by index
 export async function getFrame(
   sessionId: string,
   frameIndex: number
@@ -95,7 +90,6 @@ export async function getFrame(
     .first();
 }
 
-// Get thumbnails for a session
 export async function getThumbnailsForSession(
   sessionId: string
 ): Promise<ThumbnailData[]> {
@@ -105,7 +99,6 @@ export async function getThumbnailsForSession(
     .sortBy("frameIndex");
 }
 
-// Get a single thumbnail
 export async function getThumbnail(
   sessionId: string,
   frameIndex: number
@@ -116,7 +109,6 @@ export async function getThumbnail(
     .first();
 }
 
-// Delete a session and all associated frames/thumbnails
 export async function deleteSession(sessionId: string): Promise<void> {
   await frameDb.transaction("rw", [frameDb.sessions, frameDb.frames, frameDb.thumbnails], async () => {
     await frameDb.frames.where("sessionId").equals(sessionId).delete();
@@ -125,7 +117,6 @@ export async function deleteSession(sessionId: string): Promise<void> {
   });
 }
 
-// Store a frame blob
 export async function storeFrame(
   sessionId: string,
   frameIndex: number,
@@ -135,7 +126,7 @@ export async function storeFrame(
   blob: Blob
 ): Promise<void> {
   await frameDb.frames.put({
-    id: `${sessionId}_frame_${frameIndex}`,
+    id: `${sessionId}_frame_${String(frameIndex).padStart(6, "0")}`,
     sessionId,
     frameIndex,
     timestamp,
@@ -145,7 +136,6 @@ export async function storeFrame(
   });
 }
 
-// Store a thumbnail blob
 export async function storeThumbnail(
   sessionId: string,
   frameIndex: number,
@@ -155,7 +145,7 @@ export async function storeThumbnail(
   blob: Blob
 ): Promise<void> {
   await frameDb.thumbnails.put({
-    id: `${sessionId}_thumb_${frameIndex}`,
+    id: `${sessionId}_thumb_${String(frameIndex).padStart(6, "0")}`,
     sessionId,
     frameIndex,
     timestamp,
@@ -165,7 +155,6 @@ export async function storeThumbnail(
   });
 }
 
-// Create a new session
 export async function createSession(
   session: Omit<VideoSession, "id" | "createdAt">
 ): Promise<string> {
@@ -178,7 +167,6 @@ export async function createSession(
   return id;
 }
 
-// Update session metadata after extraction completes
 export async function updateSession(
   id: string,
   updates: Partial<VideoSession>

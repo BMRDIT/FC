@@ -1,10 +1,11 @@
+/// <reference types="@webgpu/types" />
 /**
  * SAFMN Engine — Client-side 4× image super-resolution via ONNX Runtime Web (WebGPU)
  *
  * Architecture:
  *   1. Static Tiling Engine — 1024×1024 patches with 64px overlap, mirror-padded to exact [1,3,1024,1024]
  *   2. Tensor Format Conversion — interleaved RGBA ↔ planar normalized Float32
- *   3. ONNX Runtime WebGPU Session — tensors kept in gpu-internal (VRAM) as long as possible
+ *   3. ONNX Runtime WebGPU Session — tensors kept in GPU buffers (VRAM) as long as possible
  *   4. Feathered Blending / Stitching — cosine-window blending to eliminate grid lines
  *
  * Target: modern desktop browsers with WebGPU, high-tier discrete GPUs (RTX 4060+, RX 7800 XT+)
@@ -12,7 +13,30 @@
 
 import ort from "onnxruntime-web";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Runtime configuration ───────────────────────────────────────────────
+
+/** Default model path. Override at build time via NEXT_PUBLIC_SAFMN_MODEL_PATH. */
+export const DEFAULT_MODEL_PATH =
+  process.env.NEXT_PUBLIC_SAFMN_MODEL_PATH ?? "/models/safmn_4x.onnx";
+
+/**
+ * Hard cap on source pixels, to keep CPU memory bounded. The stitch step allocates
+ * ~`src * 320` bytes of Float32 accumulators (the output covers 16× the source area),
+ * so a 1080p frame already needs ~0.65 GB. Larger inputs risk crashing the tab, so we
+ * refuse them with a clear error instead of OOM-ing. Override via
+ * NEXT_PUBLIC_SAFMN_MAX_SOURCE_PIXELS.
+ */
+export const MAX_SOURCE_PIXELS = Number(
+  process.env.NEXT_PUBLIC_SAFMN_MAX_SOURCE_PIXELS ?? 2_500_000,
+);
+
+// Serve onnxruntime-web's wasm/worker assets from our own origin instead of a CDN
+// (see scripts/copy-ort-assets.mjs). Keeps the app self-contained and CSP-compatible.
+if (typeof window !== "undefined") {
+  ort.env.wasm.wasmPaths = "/ort/";
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** Tile size the SAFMN model accepts (static shape requirement). */
 export const TILE_SIZE = 1024;
@@ -32,7 +56,7 @@ const OUTPUT_TILE_SIZE = TILE_SIZE * UPSCALE_FACTOR; // 4096
 /** Output overlap after upscaling. */
 const OUTPUT_OVERLAP = OVERLAP * UPSCALE_FACTOR; // 256
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 export interface TileInfo {
   /** 0-based column index in the tile grid. */
@@ -72,7 +96,7 @@ export interface UpscaleCallbacks {
   onComplete: (outputCanvas: HTMLCanvasElement) => void;
 }
 
-// ─── WebGPU Detection ──────────────────────────────────────────────────────────
+// ─── WebGPU Detection ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Check whether the current browser supports WebGPU.
@@ -87,7 +111,7 @@ export function isWebGPUSupported(): boolean {
   );
 }
 
-// ─── Tile Grid Computation ────────────────────────────────────────────────────
+// ─── Tile Grid Computation ────────────────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Compute the grid of tiles needed to cover an image of the given dimensions.
@@ -104,18 +128,14 @@ export function isWebGPUSupported(): boolean {
 export function computeTileGrid(srcWidth: number, srcHeight: number): TileInfo[] {
   const tiles: TileInfo[] = [];
 
-  // Number of tiles needed per axis (ceil division by stride).
   const cols = Math.max(1, Math.ceil(srcWidth / STRIDE));
   const rows = Math.max(1, Math.ceil(srcHeight / STRIDE));
 
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      // Ideal origin
       let srcX = col * STRIDE;
       let srcY = row * STRIDE;
 
-      // Clamp the last tile so it doesn't exceed the image bounds.
-      // This shifts the final tile backwards to fit within the image.
       if (srcX + TILE_SIZE > srcWidth) {
         srcX = Math.max(0, srcWidth - TILE_SIZE);
       }
@@ -123,11 +143,9 @@ export function computeTileGrid(srcWidth: number, srcHeight: number): TileInfo[]
         srcY = Math.max(0, srcHeight - TILE_SIZE);
       }
 
-      // Actual valid content dimensions (may be < TILE_SIZE at edges).
       const srcW = Math.min(TILE_SIZE, srcWidth - srcX);
       const srcH = Math.min(TILE_SIZE, srcHeight - srcY);
 
-      // Output coordinates — scale by UPSCALE_FACTOR.
       const outX = srcX * UPSCALE_FACTOR;
       const outY = srcY * UPSCALE_FACTOR;
       const outW = srcW * UPSCALE_FACTOR;
@@ -140,7 +158,7 @@ export function computeTileGrid(srcWidth: number, srcHeight: number): TileInfo[]
   return tiles;
 }
 
-// ─── Mirror Padding ───────────────────────────────────────────────────────────
+// ─── Mirror Padding ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Extract a tile from source ImageData and mirror-pad it to exactly TILE_SIZE×TILE_SIZE.
@@ -152,52 +170,46 @@ export function computeTileGrid(srcWidth: number, srcHeight: number): TileInfo[]
  * @param srcData    Source ImageData (full image).
  * @param srcX       X offset in source where tile starts.
  * @param srcY       Y offset in source where tile starts.
- * @param srcW       Valid width of source data in this tile.
- * @param srcH       Valid height of source data in this tile.
  * @returns Uint8ClampedArray of length TILE_SIZE*TILE_SIZE*4 (RGBA), mirror-padded.
  */
 function extractMirrorPaddedTile(
   srcData: ImageData,
   srcX: number,
   srcY: number,
-  srcW: number,
-  srcH: number,
 ): Uint8ClampedArray {
   const { data: src, width: srcImgW } = srcData;
   const padded = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
 
   for (let y = 0; y < TILE_SIZE; y++) {
-    // Map padded y → source y with mirroring for out-of-bounds.
     let sy = srcY + y;
-    if (sy < 0) sy = -sy;                         // mirror top
+    if (sy < 0) sy = -sy;
     if (sy >= srcData.height) {
-      sy = 2 * srcData.height - sy - 2;           // mirror bottom
+      sy = 2 * srcData.height - sy - 2;
     }
-    // Clamp as a safety net (mirror math can still overshoot by 1 on odd dims).
     sy = Math.max(0, Math.min(srcData.height - 1, sy));
 
     for (let x = 0; x < TILE_SIZE; x++) {
       let sx = srcX + x;
-      if (sx < 0) sx = -sx;                       // mirror left
+      if (sx < 0) sx = -sx;
       if (sx >= srcImgW) {
-        sx = 2 * srcImgW - sx - 2;                // mirror right
+        sx = 2 * srcImgW - sx - 2;
       }
       sx = Math.max(0, Math.min(srcImgW - 1, sx));
 
       const srcIdx = (sy * srcImgW + sx) * 4;
       const dstIdx = (y * TILE_SIZE + x) * 4;
 
-      padded[dstIdx]     = src[srcIdx];     // R
-      padded[dstIdx + 1] = src[srcIdx + 1]; // G
-      padded[dstIdx + 2] = src[srcIdx + 2]; // B
-      padded[dstIdx + 3] = 255;             // A (opaque)
+      padded[dstIdx]     = src[srcIdx];
+      padded[dstIdx + 1] = src[srcIdx + 1];
+      padded[dstIdx + 2] = src[srcIdx + 2];
+      padded[dstIdx + 3] = 255;
     }
   }
 
   return padded;
 }
 
-// ─── Tensor Format Conversion ─────────────────────────────────────────────────
+// ─── Tensor Format Conversion ──────────────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Convert RGBA pixel data (interleaved [R,G,B,A,R,G,B,A,...]) to planar
@@ -218,7 +230,6 @@ export function rgbaToPlanarFloat32(
   const pixelCount = height * width;
   const planar = new Float32Array(3 * pixelCount);
 
-  // Channel offsets for planar layout: R at [0, pc), G at [pc, 2*pc), B at [2*pc, 3*pc).
   const rOffset = 0;
   const gOffset = pixelCount;
   const bOffset = 2 * pixelCount;
@@ -228,17 +239,14 @@ export function rgbaToPlanarFloat32(
     planar[rOffset + i] = rgba[rgbaIdx]     / 255.0;
     planar[gOffset + i] = rgba[rgbaIdx + 1] / 255.0;
     planar[bOffset + i] = rgba[rgbaIdx + 2] / 255.0;
-    // Alpha is dropped — SAFMN operates on RGB only.
   }
 
   return planar;
 }
 
 /**
- * Convert a planar normalized Float32 tensor [1, 3, H, W] back to interleaved
- * RGBA Uint8ClampedArray with alpha = 255.
- *
- * Values are clamped to [0, 255] after denormalization.
+ * Convert planar normalized Float32Array [R-plane, G-plane, B-plane] back to
+ * interleaved RGBA Uint8ClampedArray.
  *
  * @param planar   Float32Array of length 3*H*W, planar RGB, values in [0,1].
  * @param height   Pixel height.
@@ -260,17 +268,16 @@ export function planarFloat32ToRGBA(
   for (let i = 0; i < pixelCount; i++) {
     const rgbaIdx = i * 4;
 
-    // Denormalize and clamp to valid byte range.
     rgba[rgbaIdx]     = Math.max(0, Math.min(255, Math.round(planar[rOffset + i] * 255.0)));
     rgba[rgbaIdx + 1] = Math.max(0, Math.min(255, Math.round(planar[gOffset + i] * 255.0)));
     rgba[rgbaIdx + 2] = Math.max(0, Math.min(255, Math.round(planar[bOffset + i] * 255.0)));
-    rgba[rgbaIdx + 3] = 255; // Fully opaque output.
+    rgba[rgbaIdx + 3] = 255;
   }
 
   return rgba;
 }
 
-// ─── Blending Weights (Cosine Window) ─────────────────────────────────────────
+// ─── Blending Weights (Cosine Window) ─────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Precompute a 2D blending weight matrix for a single output tile.
@@ -286,20 +293,16 @@ export function planarFloat32ToRGBA(
 function computeBlendWeights(validW: number, validH: number): Float32Array {
   const weights = new Float32Array(validW * validH);
 
-  // The overlap region in output space, clamped to half the valid dimension
-  // so small tiles don't have overlapping taper zones that zero out all weights.
   const ovX = Math.min(OUTPUT_OVERLAP, Math.floor(validW / 2));
   const ovY = Math.min(OUTPUT_OVERLAP, Math.floor(validH / 2));
 
   for (let y = 0; y < validH; y++) {
-    // Distance from nearest top/bottom edge of the valid region.
     let dy = 0;
     if (y < ovY) {
-      dy = (ovY - y) / ovY;           // taper from top
+      dy = (ovY - y) / ovY;
     } else if (y >= validH - ovY) {
-      dy = (y - (validH - ovY - 1)) / ovY; // taper from bottom
+      dy = (y - (validH - ovY - 1)) / ovY;
     }
-    // Raised-cosine: 0.5 * (1 + cos(pi * d))  → 1.0 at center, 0.0 at edge.
     const wy = 0.5 * (1 + Math.cos(Math.PI * Math.min(1, dy)));
 
     for (let x = 0; x < validW; x++) {
@@ -318,13 +321,13 @@ function computeBlendWeights(validW: number, validH: number): Float32Array {
   return weights;
 }
 
-// ─── SAFMN Engine ─────────────────────────────────────────────────────────────
+// ─── SAFMN Engine ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Main SAFMN super-resolution engine.
  *
  * Manages the ONNX Runtime Web session, processes tiles, and stitches results.
- * Tensors are kept in gpu-internal (VRAM) between operations to avoid
+ * Tensors are kept in GPU buffers (VRAM) between operations to avoid
  * CPU↔GPU memory transfer bottlenecks.
  */
 export class SafmnEngine {
@@ -342,9 +345,7 @@ export class SafmnEngine {
    *
    * Configures hardware-acceleration flags:
    *   - executionProviders: ['webgpu']
-   *   - preferredOutputLocation: 'gpu-internal' (keep tensors in VRAM)
-   *   - optimize_for_webgpu: "1"
-   *   - enable_graph_capture: "1"
+   *   - preferredOutputLocation: 'gpu-buffer' (keep tensors in VRAM)
    *
    * @throws Error if WebGPU is unavailable or the model fails to load.
    */
@@ -355,7 +356,6 @@ export class SafmnEngine {
       );
     }
 
-    // Verify a GPU adapter is actually available.
     const adapter = await navigator.gpu.requestAdapter({
       powerPreference: "high-performance",
     });
@@ -365,17 +365,34 @@ export class SafmnEngine {
       );
     }
 
+    // Preflight: verify the model is actually served so a missing file yields an
+    // actionable message instead of an opaque ONNX parse error.
     try {
-      this.session = await ort.InferenceSession.create(this.modelPath, {
-        executionProviders: ["webgpu"],
-        preferredOutputLocation: "gpu-internal" as any,
-        config: {
-          optimize_for_webgpu: "1",
-          enable_graph_capture: "1",
-        },
-      } as any);
+      const head = await fetch(this.modelPath, { method: "HEAD" });
+      if (!head.ok) {
+        throw new Error(
+          `SAFMN model not found at "${this.modelPath}" (HTTP ${head.status}). ` +
+            `Place safmn_4x.onnx in public/models/ (see README) or set NEXT_PUBLIC_SAFMN_MODEL_PATH.`,
+        );
+      }
     } catch (err) {
-      // Distinguish "Device Lost" / GPU handshake failures from generic errors.
+      if (err instanceof Error && err.message.startsWith("SAFMN model not found")) {
+        throw err;
+      }
+      // HEAD unsupported or transient network issue: fall through and let ORT load it.
+    }
+
+    try {
+      const sessionOptions: ort.InferenceSession.SessionOptions = {
+        executionProviders: ["webgpu"],
+        graphOptimizationLevel: "all",
+        preferredOutputLocation: "gpu-buffer",
+      };
+      this.session = await ort.InferenceSession.create(
+        this.modelPath,
+        sessionOptions,
+      );
+    } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("Device Lost") || msg.includes("device lost") || msg.includes("GPU")) {
         throw new Error(
@@ -402,9 +419,9 @@ export class SafmnEngine {
   /**
    * Run inference on a single mirror-padded tile.
    *
-   * The input tensor is created with location 'gpu-internal' so it stays in VRAM.
-   * The output tensor is also read from gpu-internal, then downloaded to CPU
-   * only when we need to stitch it into the canvas.
+   * The input tensor is created on CPU; ORT uploads it to the GPU for the WebGPU EP.
+   * The output stays in a GPU buffer (preferredOutputLocation) and is downloaded to the
+   * CPU per tile via getData(true), which also releases that GPU buffer.
    *
    * @param tileRGBA  Mirror-padded RGBA tile data (TILE_SIZE×TILE_SIZE×4).
    * @returns Float32Array containing the upscaled planar output.
@@ -414,28 +431,30 @@ export class SafmnEngine {
       throw new Error("SAFMN engine not initialized. Call init() first.");
     }
 
-    // Convert RGBA → planar Float32 [1, 3, 1024, 1024].
     const inputData = rgbaToPlanarFloat32(tileRGBA, TILE_SIZE, TILE_SIZE);
 
-    // Create input tensor — gpu-internal keeps it in VRAM.
     const inputTensor = new ort.Tensor(
       "float32",
       inputData,
       [1, 3, TILE_SIZE, TILE_SIZE],
     );
 
-    // Run inference. The session's preferredOutputLocation keeps the result in VRAM.
     const inputName = this.session.inputNames[0];
     const feeds: Record<string, ort.Tensor> = {};
     feeds[inputName] = inputTensor;
 
-    const results = await this.session.run(feeds);
-    const outputName = this.session.outputNames[0];
-    const outputTensor = results[outputName];
+    let outputTensor: ort.Tensor | undefined;
+    try {
+      const results = await this.session.run(feeds);
+      const outputName = this.session.outputNames[0];
+      outputTensor = results[outputName];
 
-    // Download from gpu-internal to CPU for stitching.
-    // The tensor data is a Float32Array in planar [1, 3, H_out, W_out] layout.
-    return outputTensor.data as Float32Array;
+      const downloaded = (await outputTensor.getData(true)) as Float32Array;
+      return new Float32Array(downloaded);
+    } finally {
+      inputTensor.dispose();
+      outputTensor?.dispose();
+    }
   }
 
   /**
@@ -450,10 +469,12 @@ export class SafmnEngine {
    *
    * @param sourceCanvas  Canvas containing the original image.
    * @param callbacks     Progress and lifecycle callbacks.
+   * @param signal        Optional AbortSignal to cancel processing.
    */
   async upscale(
     sourceCanvas: HTMLCanvasElement,
     callbacks: UpscaleCallbacks,
+    signal?: AbortSignal,
   ): Promise<void> {
     const { onProgress, onStatusChange, onTileComplete, onError, onComplete } = callbacks;
 
@@ -465,7 +486,23 @@ export class SafmnEngine {
     const srcWidth = sourceCanvas.width;
     const srcHeight = sourceCanvas.height;
 
-    // Extract full source ImageData once.
+    if (srcWidth * srcHeight > MAX_SOURCE_PIXELS) {
+      onError(
+        `Image too large to upscale safely (${(
+          (srcWidth * srcHeight) /
+          1e6
+        ).toFixed(1)} MP; limit ${(MAX_SOURCE_PIXELS / 1e6).toFixed(
+          1,
+        )} MP). Try a smaller frame or lower the source resolution.`,
+      );
+      return;
+    }
+
+    if (signal?.aborted) {
+      onStatusChange("cancelled");
+      return;
+    }
+
     const srcCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
     if (!srcCtx) {
       onError("Failed to get 2D context from source canvas.");
@@ -473,14 +510,12 @@ export class SafmnEngine {
     }
     const srcImageData = srcCtx.getImageData(0, 0, srcWidth, srcHeight);
 
-    // Compute tile grid.
     const tiles = computeTileGrid(srcWidth, srcHeight);
     const totalTiles = tiles.length;
 
     onStatusChange("processing");
     onProgress(0, totalTiles);
 
-    // Create output canvas at 4× resolution.
     const outWidth = srcWidth * UPSCALE_FACTOR;
     const outHeight = srcHeight * UPSCALE_FACTOR;
     const outputCanvas = document.createElement("canvas");
@@ -492,39 +527,35 @@ export class SafmnEngine {
       return;
     }
 
-    // We accumulate weighted color and weights separately, then normalize.
-    // This handles overlapping tiles correctly.
-    const colorAccum = new Float32Array(outWidth * outHeight * 3); // RGB accum
+    const colorAccum = new Float32Array(outWidth * outHeight * 3);
     const weightAccum = new Float32Array(outWidth * outHeight);
 
-    // Process tiles in chunks, yielding to the event loop between chunks.
     for (let i = 0; i < totalTiles; i += this.tilesPerChunk) {
       const chunkEnd = Math.min(i + this.tilesPerChunk, totalTiles);
 
       for (let j = i; j < chunkEnd; j++) {
         const tile = tiles[j];
 
+        if (signal?.aborted) {
+          onStatusChange("cancelled");
+          return;
+        }
+
         try {
-          // 1. Extract + mirror-pad tile to [1024, 1024, 4].
           const tileRGBA = extractMirrorPaddedTile(
             srcImageData,
             tile.srcX,
             tile.srcY,
-            tile.srcW,
-            tile.srcH,
           );
 
-          // 2. Run SAFMN inference → upscaled planar Float32 [1, 3, 4096, 4096].
           const outputPlanar = await this.runTileInference(tileRGBA);
 
-          // 3. Convert output planar → RGBA.
           const outputRGBA = planarFloat32ToRGBA(
             outputPlanar,
             OUTPUT_TILE_SIZE,
             OUTPUT_TILE_SIZE,
           );
 
-          // 4. Blend valid region into accumulation buffers.
           const blendWeights = computeBlendWeights(tile.outW, tile.outH);
 
           for (let py = 0; py < tile.outH; py++) {
@@ -533,7 +564,6 @@ export class SafmnEngine {
               const outGlobalY = tile.outY + py;
               const globalIdx = outGlobalY * outWidth + outGlobalX;
 
-              // Source pixel in the output tile (skip padding region).
               const localTileX = px;
               const localTileY = py;
               const tilePixelIdx = (localTileY * OUTPUT_TILE_SIZE + localTileX) * 4;
@@ -550,7 +580,6 @@ export class SafmnEngine {
           onTileComplete(tile);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          // Check for device-lost errors during inference.
           if (msg.includes("Device Lost") || msg.includes("device was lost") || msg.includes("GPU")) {
             onError(
               `WebGPU device error during tile processing (${msg}). Your GPU may have run out of memory. Try a smaller image or check your browser configuration.`,
@@ -562,18 +591,13 @@ export class SafmnEngine {
         }
       }
 
-      // Update progress after the chunk.
       onProgress(chunkEnd, totalTiles);
 
-      // Yield to the event loop so the UI can paint and stay responsive.
-      // Using setTimeout(0) is more reliable than requestAnimationFrame for
-      // long-running compute because it doesn't get throttled in background tabs.
       if (chunkEnd < totalTiles) {
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
     }
 
-    // 5. Normalize accumulated colors and write to output canvas.
     onStatusChange("stitching");
     const outImageData = outCtx.createImageData(outWidth, outHeight);
     const outData = outImageData.data;
@@ -586,7 +610,6 @@ export class SafmnEngine {
         outData[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(colorAccum[i * 3 + 2] / w)));
         outData[i * 4 + 3] = 255;
       } else {
-        // Fallback for any pixel not covered by a tile (shouldn't happen with correct grid).
         outData[i * 4]     = 0;
         outData[i * 4 + 1] = 0;
         outData[i * 4 + 2] = 0;

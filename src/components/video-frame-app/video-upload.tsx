@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback } from "react";
-import { useDropzone } from "react-dropzone";
+import { useDropzone, type FileRejection } from "react-dropzone";
 import { Upload, Film, AlertCircle, FileVideo } from "lucide-react";
 import { useVideoStore } from "@/store/video-store";
 import { cn } from "@/lib/utils";
@@ -33,7 +33,7 @@ export function VideoUpload() {
   } = useVideoStore();
 
   const onDrop = useCallback(
-    (acceptedFiles: File[], rejectedFiles: any[]) => {
+    (acceptedFiles: File[], rejectedFiles: FileRejection[]) => {
       setExtractionError(null);
 
       if (rejectedFiles.length > 0) {
@@ -42,7 +42,7 @@ export function VideoUpload() {
           setExtractionError("File is too large. Maximum size is 5GB.");
         } else if (error?.code === "file-invalid-type") {
           setExtractionError(
-            "Unsupported file format. Please upload a video file (MP4, WebM, MOV, AVI, MKV)."
+            "Unsupported file format. Please upload a video file (MP4, WebM, MOV, AVI, MKV).",
           );
         } else {
           setExtractionError("Invalid file. Please try a different video.");
@@ -62,17 +62,16 @@ export function VideoUpload() {
         });
       }
     },
-    [setVideoFile, setExtractionError]
+    [setVideoFile, setExtractionError],
   );
 
-  const { getRootProps, getInputProps, isDragActive, isDragReject } =
-    useDropzone({
-      onDrop,
-      accept: ACCEPTED_VIDEO_TYPES,
-      maxFiles: 1,
-      maxSize: MAX_FILE_SIZE,
-      disabled: extractionStatus === "extracting",
-    });
+  const { getRootProps, getInputProps, isDragActive, isDragReject } = useDropzone({
+    onDrop,
+    accept: ACCEPTED_VIDEO_TYPES,
+    maxFiles: 1,
+    maxSize: MAX_FILE_SIZE,
+    disabled: extractionStatus === "extracting",
+  });
 
   const isDisabled = extractionStatus === "extracting";
 
@@ -86,7 +85,7 @@ export function VideoUpload() {
           isDragReject && "border-destructive bg-destructive/5",
           !isDragActive && !isDisabled && "border-muted-foreground/25 hover:border-primary/50 hover:bg-muted/50",
           isDisabled && "opacity-50 cursor-not-allowed border-muted",
-          videoFile && !isDragActive && "border-primary/30 bg-primary/5"
+          videoFile && !isDragActive && "border-primary/30 bg-primary/5",
         )}
         role="button"
         aria-label="Upload video file by clicking or dragging"
@@ -104,7 +103,8 @@ export function VideoUpload() {
                 {videoFile.name}
               </h3>
               <p className="text-sm text-muted-foreground">
-                {formatFileSize(videoFile.size)} • {videoFile.type.split("/")[1].toUpperCase()}
+                {formatFileSize(videoFile.size)} •{" "}
+                {(videoFile.type.split("/")[1] || "video").toUpperCase()}
               </p>
             </div>
             <p className="text-xs text-muted-foreground">
