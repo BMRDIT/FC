@@ -286,9 +286,10 @@ export function planarFloat32ToRGBA(
 function computeBlendWeights(validW: number, validH: number): Float32Array {
   const weights = new Float32Array(validW * validH);
 
-  // The overlap region in output space.
-  const ovX = OUTPUT_OVERLAP;
-  const ovY = OUTPUT_OVERLAP;
+  // The overlap region in output space, clamped to half the valid dimension
+  // so small tiles don't have overlapping taper zones that zero out all weights.
+  const ovX = Math.min(OUTPUT_OVERLAP, Math.floor(validW / 2));
+  const ovY = Math.min(OUTPUT_OVERLAP, Math.floor(validH / 2));
 
   for (let y = 0; y < validH; y++) {
     // Distance from nearest top/bottom edge of the valid region.
@@ -485,7 +486,7 @@ export class SafmnEngine {
     const outputCanvas = document.createElement("canvas");
     outputCanvas.width = outWidth;
     outputCanvas.height = outHeight;
-    const outCtx = outputCanvas.getContext("2d");
+    const outCtx = outputCanvas.getContext("2d", { willReadFrequently: true });
     if (!outCtx) {
       onError("Failed to get 2D context for output canvas.");
       return;
