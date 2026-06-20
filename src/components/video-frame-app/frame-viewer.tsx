@@ -39,8 +39,6 @@ export function FrameViewer() {
     goPrevFrame,
     goFirstFrame,
     goLastFrame,
-    // Upscale state from store (driven by timeline enhance buttons)
-    upscaleStatusMap,
     upscalingFrameIndex,
     upscaleProgress,
     upscaleTileInfo,
@@ -50,130 +48,121 @@ export function FrameViewer() {
     showUpscaledOverlay,
     setShowUpscaledOverlay,
     setUpscaleError,
+    cancelUpscale,
     clearAllUpscale,
   } = useVideoStore();
 
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const urlRef = useRef<string | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Preload adjacent frames
-  const preloadRef = useRef<Map<number, string>>(new Map());
+  const cacheRef = useRef<Map<number, string>>(new Map());
+  const prevSessionRef = useRef<string>(currentSession?.id || "");
+  const PRELOAD_AHEAD = 3;
+  const KEEP_RANGE = 10;
 
   const sessionId = currentSession?.id || "";
 
-  // The upscaled image belongs to the currently selected frame
-  const hasUpscaledForCurrentFrame =
-    !!(upscaledImageUrl && upscaledImageFrameIndex === selectedFrameIndex);
+  const hasUpscaledForCurrentFrame = !!(
+    upscaledImageUrl && upscaledImageFrameIndex === selectedFrameIndex
+  );
   const isCurrentFrameUpscaling = upscalingFrameIndex === selectedFrameIndex;
 
-  // Cleanup function for URLs
-  const cleanupUrl = useCallback(() => {
-    if (urlRef.current) {
-      URL.revokeObjectURL(urlRef.current);
-      urlRef.current = null;
-    }
+  const [prevSession, setPrevSession] = useState(sessionId);
+  if (sessionId !== prevSession) {
+    setPrevSession(sessionId);
+    setFrameUrl(null);
+  }
+
+  const flushCache = useCallback(() => {
+    for (const url of cacheRef.current.values()) URL.revokeObjectURL(url);
+    cacheRef.current.clear();
   }, []);
 
-  // Hide overlay when switching frames (unless the new frame also has an upscaled result)
   useEffect(() => {
-    if (upscaledImageFrameIndex !== null && upscaledImageFrameIndex !== selectedFrameIndex) {
+    if (
+      upscaledImageFrameIndex !== null &&
+      upscaledImageFrameIndex !== selectedFrameIndex
+    ) {
       setShowUpscaledOverlay(false);
     }
   }, [selectedFrameIndex, upscaledImageFrameIndex, setShowUpscaledOverlay]);
 
-  // Load frame when selection changes
   useEffect(() => {
-    if (!sessionId || extractionStatus === "idle" || extractionStatus === "extracting") {
+    if (
+      !sessionId ||
+      extractionStatus === "idle" ||
+      extractionStatus === "extracting"
+    ) {
       return;
     }
 
     let cancelled = false;
-    const startLoading = () => setIsLoading(true);
-    startLoading();
+    const cache = cacheRef.current;
 
-    // Check preload cache first
-    const cachedUrl = preloadRef.current.get(selectedFrameIndex);
+    if (prevSessionRef.current !== sessionId) {
+      flushCache();
+      prevSessionRef.current = sessionId;
+    }
 
-    const loadFrame = async () => {
+    const urlFor = async (index: number): Promise<string | null> => {
+      const cached = cache.get(index);
+      if (cached) return cached;
+      const frame = await getFrame(sessionId, index);
+      if (!frame) return null;
+      const url = URL.createObjectURL(frame.blob);
+      cache.set(index, url);
+      return url;
+    };
+
+    const run = async () => {
+      setIsLoading(true);
       try {
-        const frame = await getFrame(sessionId, selectedFrameIndex);
-        if (frame && !cancelled) {
-          cleanupUrl();
-          const url = cachedUrl || URL.createObjectURL(frame.blob);
-          urlRef.current = url;
-          setFrameUrl(url);
+        const url = await urlFor(selectedFrameIndex);
+        if (cancelled) return;
+        setFrameUrl(url);
 
-          // Cache this URL
-          if (!cachedUrl) {
-            preloadRef.current.set(selectedFrameIndex, url);
+        for (let offset = 1; offset <= PRELOAD_AHEAD; offset++) {
+          const idx = selectedFrameIndex + offset;
+          if (idx < totalFrames && !cache.has(idx)) {
+            try {
+              await urlFor(idx);
+            } catch {
+              /* ignore prefetch errors */
+            }
           }
+        }
 
-          // Preload next 3 frames
-          const preloadNext = async () => {
-            for (let offset = 1; offset <= 3; offset++) {
-              const preloadIdx = selectedFrameIndex + offset;
-              if (preloadIdx < totalFrames && !preloadRef.current.has(preloadIdx)) {
-                try {
-                  const nextFrame = await getFrame(sessionId, preloadIdx);
-                  if (nextFrame) {
-                    const nextUrl = URL.createObjectURL(nextFrame.blob);
-                    preloadRef.current.set(preloadIdx, nextUrl);
-                  }
-                } catch {
-                  // Ignore preload errors
-                }
-              }
-            }
-          };
-          preloadNext();
-
-          // Cleanup old preload cache (keep only nearby frames)
-          const keepRange = 10;
-          for (const [idx] of preloadRef.current) {
-            if (Math.abs(idx - selectedFrameIndex) > keepRange) {
-              const oldUrl = preloadRef.current.get(idx);
-              if (oldUrl && idx !== selectedFrameIndex) {
-                URL.revokeObjectURL(oldUrl);
-              }
-              preloadRef.current.delete(idx);
-            }
+        for (const idx of Array.from(cache.keys())) {
+          if (Math.abs(idx - selectedFrameIndex) > KEEP_RANGE) {
+            const old = cache.get(idx);
+            if (old) URL.revokeObjectURL(old);
+            cache.delete(idx);
           }
         }
       } catch {
-        if (!cancelled) {
-          setFrameUrl(null);
-        }
+        if (!cancelled) setFrameUrl(null);
       } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
+        if (!cancelled) setIsLoading(false);
       }
     };
 
-    loadFrame();
+    run();
 
     return () => {
       cancelled = true;
     };
-  }, [sessionId, selectedFrameIndex, extractionStatus, totalFrames, cleanupUrl]);
+  }, [sessionId, selectedFrameIndex, extractionStatus, totalFrames, flushCache]);
 
-  // Global cleanup
   useEffect(() => {
     return () => {
-      cleanupUrl();
-      for (const [, url] of preloadRef.current) {
-        URL.revokeObjectURL(url);
-      }
-      preloadRef.current.clear();
+      flushCache();
       clearAllUpscale();
     };
-  }, [cleanupUrl, clearAllUpscale]);
+  }, [flushCache, clearAllUpscale]);
 
-  // Keyboard navigation
   useEffect(() => {
     if (extractionStatus !== "completed") return;
 
@@ -209,19 +198,19 @@ export function FrameViewer() {
         case "+":
         case "=":
           e.preventDefault();
-          setViewerZoom(viewerZoom + 0.25);
+          setViewerZoom(useVideoStore.getState().viewerZoom + 0.25);
           break;
         case "-":
         case "_":
           e.preventDefault();
-          setViewerZoom(viewerZoom - 0.25);
+          setViewerZoom(useVideoStore.getState().viewerZoom - 0.25);
           break;
         case "0":
           e.preventDefault();
           resetViewerZoom();
           break;
         case "Escape":
-          if (showUpscaledOverlay) {
+          if (useVideoStore.getState().showUpscaledOverlay) {
             e.preventDefault();
             setShowUpscaledOverlay(false);
           }
@@ -237,21 +226,24 @@ export function FrameViewer() {
     goPrevFrame,
     goFirstFrame,
     goLastFrame,
-    viewerZoom,
     setViewerZoom,
     resetViewerZoom,
-    showUpscaledOverlay,
     setShowUpscaledOverlay,
   ]);
 
-  // Fullscreen toggle
   const toggleFullscreen = useCallback(() => {
     if (!containerRef.current) return;
 
     if (!document.fullscreenElement) {
-      containerRef.current.requestFullscreen().then(() => setIsFullscreen(true)).catch(() => {});
+      containerRef.current
+        .requestFullscreen()
+        .then(() => setIsFullscreen(true))
+        .catch(() => {});
     } else {
-      document.exitFullscreen().then(() => setIsFullscreen(false)).catch(() => {});
+      document
+        .exitFullscreen()
+        .then(() => setIsFullscreen(false))
+        .catch(() => {});
     }
   }, []);
 
@@ -261,7 +253,6 @@ export function FrameViewer() {
     return () => document.removeEventListener("fullscreenchange", handler);
   }, []);
 
-  // Download upscaled image
   const handleDownloadUpscaled = useCallback(() => {
     if (!upscaledImageUrl) return;
     const link = document.createElement("a");
@@ -270,12 +261,10 @@ export function FrameViewer() {
     link.click();
   }, [upscaledImageUrl, upscaledImageFrameIndex]);
 
-  // Close upscaled overlay
   const handleCloseUpscaled = useCallback(() => {
     setShowUpscaledOverlay(false);
   }, [setShowUpscaledOverlay]);
 
-  // Show upscaled overlay if available for current frame
   const handleShowUpscaled = useCallback(() => {
     if (hasUpscaledForCurrentFrame) {
       setShowUpscaledOverlay(true);
@@ -311,7 +300,6 @@ export function FrameViewer() {
       role="region"
       aria-label="Frame viewer"
     >
-      {/* Frame info bar */}
       <div className="flex items-center justify-between px-3 py-1.5 bg-black/80 border-b border-white/10 text-white/80">
         <div className="flex items-center gap-3 text-xs font-mono">
           <span className="text-white/60">{timestamp}</span>
@@ -328,7 +316,6 @@ export function FrameViewer() {
           )}
         </div>
         <div className="flex items-center gap-1">
-          {/* Show upscaled button — only visible when a result exists for this frame */}
           {hasUpscaledForCurrentFrame && !showUpscaledOverlay && (
             <Button
               variant="ghost"
@@ -342,7 +329,6 @@ export function FrameViewer() {
               <span className="hidden sm:inline">Show 4×</span>
             </Button>
           )}
-          {/* Upscaling indicator in toolbar */}
           {isCurrentFrameUpscaling && (
             <span className="flex items-center gap-1.5 text-xs text-green-400 px-2">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -396,7 +382,6 @@ export function FrameViewer() {
         </div>
       </div>
 
-      {/* Main frame display area */}
       <div className="flex-1 flex items-center justify-center overflow-hidden p-2 relative">
         {isLoading && !frameUrl ? (
           <div className="flex flex-col items-center gap-3">
@@ -430,10 +415,8 @@ export function FrameViewer() {
           </div>
         )}
 
-        {/* ─── Upscaled image overlay (on top of the canvas) ─────────────────── */}
         {showUpscaledOverlay && hasUpscaledForCurrentFrame && upscaledImageUrl && (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/90 backdrop-blur-sm">
-            {/* Close button */}
             <Button
               variant="ghost"
               size="icon"
@@ -444,7 +427,6 @@ export function FrameViewer() {
               <X className="w-4 h-4" />
             </Button>
 
-            {/* Download button */}
             <Button
               variant="ghost"
               size="sm"
@@ -455,7 +437,6 @@ export function FrameViewer() {
               <span className="text-xs">Download</span>
             </Button>
 
-            {/* Upscaled image — displayed on top of the frame canvas */}
             <img
               src={upscaledImageUrl}
               alt={`Upscaled frame ${selectedFrameIndex + 1}`}
@@ -466,14 +447,12 @@ export function FrameViewer() {
               }}
             />
 
-            {/* Info badge */}
             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-green-500/20 px-3 py-1 text-xs font-medium text-green-400 backdrop-blur-sm">
               4× Super-Resolution • SAFMN • WebGPU • Frame {selectedFrameIndex + 1}
             </div>
           </div>
         )}
 
-        {/* ─── Upscaling progress overlay ────────────────────────────────────── */}
         {isCurrentFrameUpscaling && (
           <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-4 bg-black/85 backdrop-blur-sm">
             <Loader2 className="w-10 h-10 text-green-400 animate-spin" />
@@ -485,7 +464,6 @@ export function FrameViewer() {
                 {upscaleTileInfo || "Initializing..."}
               </p>
             </div>
-            {/* Progress bar */}
             <div className="w-48 h-1.5 bg-white/10 rounded-full overflow-hidden">
               <div
                 className="h-full bg-green-400 rounded-full transition-all duration-200 ease-out"
@@ -495,10 +473,19 @@ export function FrameViewer() {
             <p className="text-xs text-white/40 font-mono">
               {upscaleProgress.toFixed(1)}%
             </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1.5 text-white/70 hover:text-white hover:bg-white/10"
+              onClick={cancelUpscale}
+              aria-label="Cancel upscale"
+            >
+              <X className="w-3.5 h-3.5" />
+              <span className="text-xs">Cancel</span>
+            </Button>
           </div>
         )}
 
-        {/* ─── Upscale error overlay ─────────────────────────────────────────── */}
         {upscaleError && !isCurrentFrameUpscaling && (
           <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-20 max-w-md">
             <div className="flex items-center gap-2 rounded-lg bg-red-500/15 px-4 py-2 text-sm text-red-400 backdrop-blur-sm border border-red-500/20">
@@ -515,7 +502,6 @@ export function FrameViewer() {
         )}
       </div>
 
-      {/* Navigation controls */}
       <div className="flex items-center justify-center gap-2 px-4 py-2 bg-black/80 border-t border-white/10">
         <Button
           variant="ghost"
@@ -566,7 +552,6 @@ export function FrameViewer() {
         </Button>
       </div>
 
-      {/* Frame scrubber / progress bar */}
       <div className="px-4 pb-2 bg-black/80">
         <input
           type="range"

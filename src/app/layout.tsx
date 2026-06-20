@@ -15,11 +15,22 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Frame Extractor - Client-Side Video Frame Extraction",
-  description: "Extract and view individual frames from video files entirely in your browser. No uploads, no servers, fully private.",
-  keywords: ["video", "frames", "extraction", "browser", "client-side", "WebCodecs", "IndexedDB"],
-  authors: [{ name: "Z.ai Team" }],
+  description:
+    "Extract and view individual frames from video files entirely in your browser. No uploads, no servers, fully private.",
+  keywords: [
+    "video",
+    "frames",
+    "extraction",
+    "browser",
+    "client-side",
+    "WebGPU",
+    "super-resolution",
+    "SAFMN",
+    "IndexedDB",
+  ],
+  authors: [{ name: "Frame Extractor" }],
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: "/logo.svg",
   },
   openGraph: {
     title: "Frame Extractor",

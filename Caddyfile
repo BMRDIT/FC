@@ -1,17 +1,8 @@
 :81 {
-	@transform_port_query {
-		query XTransformPort=*
-	}
-
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
-
+	# NOTE: The previous `XTransformPort` query handler that did
+	# `reverse_proxy localhost:{query.XTransformPort}` was removed: it allowed any
+	# caller to proxy to an arbitrary localhost port (SSRF / internal-service exposure).
+	# Only the application on port 3000 is proxied.
 	handle {
 		reverse_proxy localhost:3000 {
 			header_up Host {host}

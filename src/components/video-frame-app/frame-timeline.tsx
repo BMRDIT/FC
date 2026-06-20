@@ -5,22 +5,15 @@ import { useVideoStore } from "@/store/video-store";
 import { getThumbnail, getFrame } from "@/lib/frame-db";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  SafmnEngine,
-  isWebGPUSupported,
-} from "@/lib/safmn-engine";
+import { SafmnEngine, isWebGPUSupported, DEFAULT_MODEL_PATH } from "@/lib/safmn-engine";
 import { Sparkles, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 
 const THUMB_WIDTH = 96;
 const THUMB_HEIGHT = 54;
-const VISIBLE_BUFFER = 5; // Load thumbnails +/- N around selected
+const GAP = 6;
+const ITEM = THUMB_WIDTH + GAP;
+const OVERSCAN = 6;
 
-/** Path to the SAFMN ONNX model — served from the public directory. */
-const MODEL_PATH = "/models/safmn_4x.onnx";
-
-// ─── Shared engine singleton ──────────────────────────────────────────────────
-// A single SafmnEngine instance shared across all ThumbnailItem components
-// so the ONNX session is loaded once and reused for every frame.
 let sharedEngine: SafmnEngine | null = null;
 let engineInitPromise: Promise<SafmnEngine | null> | null = null;
 
@@ -34,7 +27,7 @@ async function getSharedEngine(): Promise<SafmnEngine | null> {
         await sharedEngine.dispose();
         sharedEngine = null;
       }
-      const engine = new SafmnEngine({ modelPath: MODEL_PATH });
+      const engine = new SafmnEngine({ modelPath: DEFAULT_MODEL_PATH });
       await engine.init();
       sharedEngine = engine;
       return engine;
@@ -48,8 +41,6 @@ async function getSharedEngine(): Promise<SafmnEngine | null> {
   return engineInitPromise;
 }
 
-// ─── ThumbnailItem ────────────────────────────────────────────────────────────
-
 interface ThumbnailItemProps {
   sessionId: string;
   frameIndex: number;
@@ -61,7 +52,6 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
   const urlRef = useRef<string | null>(null);
 
-  // Upscale state from the store
   const upscaleStatus = useVideoStore((s) => s.upscaleStatusMap[frameIndex] || "idle");
   const upscalingFrameIndex = useVideoStore((s) => s.upscalingFrameIndex);
   const setSelectedFrameIndex = useVideoStore((s) => s.setSelectedFrameIndex);
@@ -73,6 +63,7 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
   const setUpscaledImageFrameIndex = useVideoStore((s) => s.setUpscaledImageFrameIndex);
   const setShowUpscaledOverlay = useVideoStore((s) => s.setShowUpscaledOverlay);
   const setUpscaleError = useVideoStore((s) => s.setUpscaleError);
+  const setUpscaleAbort = useVideoStore((s) => s.setUpscaleAbort);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,30 +87,23 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
       cancelled = true;
       if (urlRef.current) {
         URL.revokeObjectURL(urlRef.current);
+        urlRef.current = null;
       }
     };
   }, [sessionId, frameIndex]);
 
-  /**
-   * Upscale this specific frame using the SAFMN WebGPU engine.
-   * The result is stored in the shared store so the FrameViewer can
-   * display it as an overlay on top of the canvas.
-   */
   const handleUpscale = useCallback(
     async (e: React.MouseEvent) => {
       e.stopPropagation();
 
-      // Don't allow concurrent upscales
       if (upscalingFrameIndex !== null) return;
 
-      // If already upscaled, just show the result
       if (upscaleStatus === "completed") {
         setSelectedFrameIndex(frameIndex);
         setShowUpscaledOverlay(true);
         return;
       }
 
-      // Check WebGPU support
       if (!isWebGPUSupported()) {
         setUpscaleError(
           "WebGPU is not supported in this browser. Please use a recent version of Chrome or Edge.",
@@ -128,7 +112,6 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
         return;
       }
 
-      // Select this frame so the viewer shows it
       setSelectedFrameIndex(frameIndex);
       setUpscaleStatus(frameIndex, "processing");
       setUpscalingFrameIndex(frameIndex);
@@ -137,11 +120,22 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
       setUpscaleError(null);
       setShowUpscaledOverlay(false);
 
+      const controller = new AbortController();
+      setUpscaleAbort(controller);
+
+      const finishTransient = () => {
+        setUpscalingFrameIndex(null);
+        setUpscaleAbort(null);
+      };
+
       try {
         const engine = await getSharedEngine();
         if (!engine) throw new Error("Failed to initialize SAFMN engine.");
+        if (controller.signal.aborted) {
+          finishTransient();
+          return;
+        }
 
-        // Load the full-resolution frame blob
         const frame = await getFrame(sessionId, frameIndex);
         if (!frame) throw new Error("Failed to load frame from storage.");
 
@@ -150,40 +144,56 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
         sourceCanvas.width = bitmap.width;
         sourceCanvas.height = bitmap.height;
         const ctx = sourceCanvas.getContext("2d", { willReadFrequently: true });
-        if (!ctx) throw new Error("Failed to get 2D canvas context.");
+        if (!ctx) {
+          bitmap.close();
+          throw new Error("Failed to get 2D canvas context.");
+        }
         ctx.drawImage(bitmap, 0, 0);
         bitmap.close();
 
-        // Run the upscale pipeline
-        await engine.upscale(sourceCanvas, {
-          onProgress: (tileIndex, total) => {
-            setUpscaleProgress((tileIndex / total) * 100);
-            setUpscaleTileInfo(`Tile ${tileIndex} of ${total}`);
+        await engine.upscale(
+          sourceCanvas,
+          {
+            onProgress: (tileIndex, total) => {
+              setUpscaleProgress((tileIndex / total) * 100);
+              setUpscaleTileInfo(`Tile ${tileIndex} of ${total}`);
+            },
+            onStatusChange: (status) => {
+              if (status === "stitching") {
+                setUpscaleStatus(frameIndex, "stitching");
+                setUpscaleTileInfo("Stitching tiles...");
+              } else if (status === "cancelled") {
+                setUpscaleStatus(frameIndex, "idle");
+                finishTransient();
+              }
+            },
+            onTileComplete: () => {},
+            onError: (err) => {
+              setUpscaleError(err);
+              setUpscaleStatus(frameIndex, "error");
+              finishTransient();
+            },
+            onComplete: (outputCanvas) => {
+              outputCanvas.toBlob((blob) => {
+                if (!blob) {
+                  setUpscaleError("Failed to encode the upscaled image.");
+                  setUpscaleStatus(frameIndex, "error");
+                  finishTransient();
+                  return;
+                }
+                const objectUrl = URL.createObjectURL(blob);
+                setUpscaledImageUrl(objectUrl);
+                setUpscaledImageFrameIndex(frameIndex);
+                setUpscaleStatus(frameIndex, "completed");
+                setShowUpscaledOverlay(true);
+                setUpscaleProgress(100);
+                setUpscaleTileInfo("");
+                finishTransient();
+              }, "image/png");
+            },
           },
-          onStatusChange: (status) => {
-            if (status === "stitching") {
-              setUpscaleStatus(frameIndex, "stitching");
-              setUpscaleTileInfo("Stitching tiles...");
-            }
-          },
-          onTileComplete: () => {},
-          onError: (err) => {
-            setUpscaleError(err);
-            setUpscaleStatus(frameIndex, "error");
-            setUpscalingFrameIndex(null);
-          },
-          onComplete: (outputCanvas) => {
-            // Convert output canvas to data URL for display
-            const dataUrl = outputCanvas.toDataURL("image/png");
-            setUpscaledImageUrl(dataUrl);
-            setUpscaledImageFrameIndex(frameIndex);
-            setUpscaleStatus(frameIndex, "completed");
-            setShowUpscaledOverlay(true);
-            setUpscalingFrameIndex(null);
-            setUpscaleProgress(100);
-            setUpscaleTileInfo("");
-          },
-        });
+          controller.signal,
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (
@@ -198,7 +208,7 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
           setUpscaleError(`Upscale failed: ${msg}`);
         }
         setUpscaleStatus(frameIndex, "error");
-        setUpscalingFrameIndex(null);
+        finishTransient();
       }
     },
     [
@@ -215,6 +225,7 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
       setUpscaledImageFrameIndex,
       setShowUpscaledOverlay,
       setUpscaleError,
+      setUpscaleAbort,
     ],
   );
 
@@ -229,7 +240,7 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
           ? "border-primary ring-2 ring-primary/30"
           : "border-transparent hover:border-white/20",
       )}
-      style={{ width: THUMB_WIDTH, height: THUMB_HEIGHT }}
+      style={{ width: THUMB_WIDTH, height: THUMB_HEIGHT, marginRight: GAP }}
       onClick={onClick}
     >
       {thumbUrl ? (
@@ -243,33 +254,28 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
         <Skeleton className="w-full h-full" />
       )}
 
-      {/* Frame index label */}
       <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-[9px] font-mono text-center py-0.5 tabular-nums">
         {frameIndex + 1}
       </div>
 
-      {/* Completed badge */}
       {upscaleStatus === "completed" && (
         <div className="absolute top-0.5 right-0.5 z-10">
           <CheckCircle2 className="w-3.5 h-3.5 text-green-400 drop-shadow-md" />
         </div>
       )}
 
-      {/* Error badge */}
       {upscaleStatus === "error" && (
         <div className="absolute top-0.5 right-0.5 z-10">
           <AlertCircle className="w-3.5 h-3.5 text-red-400 drop-shadow-md" />
         </div>
       )}
 
-      {/* Processing spinner overlay */}
       {isThisUpscaling && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70">
           <Loader2 className="w-4 h-4 text-green-400 animate-spin" />
         </div>
       )}
 
-      {/* Enhance button — appears on hover, or when completed/error */}
       <button
         className={cn(
           "absolute top-0.5 left-0.5 z-10 flex items-center justify-center rounded-full transition-all",
@@ -293,9 +299,7 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
               : `Enhance frame ${frameIndex + 1} (4× SAFMN)`
         }
       >
-        {upscaleStatus === "completed" ? (
-          <Sparkles className="w-3 h-3" />
-        ) : upscaleStatus === "error" ? (
+        {upscaleStatus === "error" ? (
           <AlertCircle className="w-3 h-3" />
         ) : (
           <Sparkles className="w-3 h-3" />
@@ -305,59 +309,57 @@ function ThumbnailItem({ sessionId, frameIndex, isSelected, onClick }: Thumbnail
   );
 }
 
-// ─── FrameTimeline ────────────────────────────────────────────────────────────
-
 export function FrameTimeline() {
-  const {
-    selectedFrameIndex,
-    setSelectedFrameIndex,
-    totalFrames,
-    currentSession,
-    extractionStatus,
-  } = useVideoStore();
+  const { selectedFrameIndex, setSelectedFrameIndex, totalFrames, currentSession, extractionStatus } =
+    useVideoStore();
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const [visibleRange, setVisibleRange] = useState<{
-    start: number;
-    end: number;
-  }>({ start: 0, end: 50 });
+  const rafRef = useRef<number | null>(null);
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const [containerWidth, setContainerWidth] = useState(800);
 
   const sessionId = currentSession?.id || "";
 
-  // Calculate visible range based on total frames
-  const displayRange = useMemo(() => {
-    const maxVisible = 200; // Max thumbnails to render in DOM at once
-    const start = Math.max(0, selectedFrameIndex - VISIBLE_BUFFER);
-    const end = Math.min(totalFrames, selectedFrameIndex + maxVisible - VISIBLE_BUFFER);
-    return { start, end: Math.max(start, end) };
-  }, [selectedFrameIndex, totalFrames]);
-
-  // Auto-scroll to keep selected frame visible
   useEffect(() => {
-    if (!containerRef.current || totalFrames === 0) return;
-
-    const container = containerRef.current;
-    const thumbWidth = THUMB_WIDTH + 6; // width + gap
-    const targetScroll =
-      selectedFrameIndex * thumbWidth - container.clientWidth / 2 + thumbWidth / 2;
-
-    container.scrollTo({
-      left: Math.max(0, targetScroll),
-      behavior: "smooth",
+    const el = containerRef.current;
+    if (!el) return;
+    setContainerWidth(el.clientWidth);
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) setContainerWidth(entry.contentRect.width);
     });
-  }, [selectedFrameIndex, totalFrames]);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const { start, end } = useMemo(() => {
+    const visibleCount = Math.ceil(containerWidth / ITEM) + OVERSCAN * 2;
+    const s = Math.max(0, Math.floor(scrollLeft / ITEM) - OVERSCAN);
+    const e = Math.min(totalFrames, s + visibleCount);
+    return { start: s, end: Math.max(s, e) };
+  }, [scrollLeft, containerWidth, totalFrames]);
 
   const handleScroll = useCallback(() => {
-    if (!containerRef.current) return;
-    const container = containerRef.current;
-    const scrollLeft = container.scrollLeft;
-    const thumbWidth = THUMB_WIDTH + 6;
-    const startIdx = Math.max(0, Math.floor(scrollLeft / thumbWidth) - 10);
-    const endIdx = startIdx + 300;
-    setVisibleRange({ start: startIdx, end: Math.min(endIdx, totalFrames) });
-  }, [totalFrames]);
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      if (containerRef.current) setScrollLeft(containerRef.current.scrollLeft);
+    });
+  }, []);
 
-  // Dispose shared engine on unmount to free GPU resources.
+  useEffect(
+    () => () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || totalFrames === 0) return;
+    const targetScroll = selectedFrameIndex * ITEM - container.clientWidth / 2 + THUMB_WIDTH / 2;
+    container.scrollTo({ left: Math.max(0, targetScroll), behavior: "smooth" });
+  }, [selectedFrameIndex, totalFrames]);
+
   useEffect(() => {
     return () => {
       if (sharedEngine) {
@@ -372,9 +374,11 @@ export function FrameTimeline() {
     return null;
   }
 
+  const leftSpacer = start * ITEM;
+  const rightSpacer = Math.max(0, (totalFrames - end) * ITEM);
+
   return (
     <div className="border-t border-border bg-card/50">
-      {/* Timeline header */}
       <div className="flex items-center justify-between px-4 py-1.5">
         <span className="text-xs font-medium text-muted-foreground">Timeline</span>
         <span className="text-xs text-muted-foreground tabular-nums">
@@ -382,39 +386,28 @@ export function FrameTimeline() {
         </span>
       </div>
 
-      {/* Scrollable thumbnail strip */}
       <div
         ref={containerRef}
-        className="flex gap-1.5 overflow-x-auto px-4 pb-3 scroll-smooth"
+        className="flex overflow-x-auto px-4 pb-3 scroll-smooth"
         onScroll={handleScroll}
         style={{ scrollbarWidth: "thin" }}
       >
-        {/* Pre-spacer for virtualization */}
-        {displayRange.start > 0 && (
-          <div style={{ width: displayRange.start * (THUMB_WIDTH + 6) }} className="shrink-0" />
-        )}
+        {leftSpacer > 0 && <div style={{ width: leftSpacer }} className="shrink-0" />}
 
-        {Array.from(
-          {
-            length:
-              Math.min(
-                totalFrames,
-                extractionStatus === "completed" ? totalFrames : displayRange.end,
-              ) - displayRange.start,
-          },
-          (_, i) => {
-            const frameIdx = displayRange.start + i;
-            return (
-              <ThumbnailItem
-                key={frameIdx}
-                sessionId={sessionId}
-                frameIndex={frameIdx}
-                isSelected={frameIdx === selectedFrameIndex}
-                onClick={() => setSelectedFrameIndex(frameIdx)}
-              />
-            );
-          },
-        )}
+        {Array.from({ length: end - start }, (_, i) => {
+          const frameIdx = start + i;
+          return (
+            <ThumbnailItem
+              key={frameIdx}
+              sessionId={sessionId}
+              frameIndex={frameIdx}
+              isSelected={frameIdx === selectedFrameIndex}
+              onClick={() => setSelectedFrameIndex(frameIdx)}
+            />
+          );
+        })}
+
+        {rightSpacer > 0 && <div style={{ width: rightSpacer }} className="shrink-0" />}
       </div>
     </div>
   );
