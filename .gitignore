@@ -52,3 +52,14 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Generated/runtime artifacts (never commit)
+*.pid
+db/*.db
+*.sqlite
+*.sqlite3
+
+# Self-hosted, build-copied runtime assets (regenerated on install/build)
+/public/ort/
+# Large ML model weights — distribute out-of-band (see README)
+/public/models/
