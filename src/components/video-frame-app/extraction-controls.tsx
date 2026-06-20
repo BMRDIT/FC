@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { useVideoStore } from "@/store/video-store";
+import { useVideoStore, type ExtractionStatus } from "@/store/video-store";
 import {
   extractFramesSequential,
   detectVideoMetadata,
@@ -26,6 +26,8 @@ import {
   Clock,
   Film,
   HardDrive,
+  X,
+  AlertTriangle,
 } from "lucide-react";
 import {
   Tooltip,
@@ -54,6 +56,8 @@ export function ExtractionControls() {
     setExtractionStartTime,
     setExtractionError,
     setExtractionMethod,
+    setExtractionAbort,
+    cancelExtraction,
     setCurrentSession,
     setTotalFrames,
     setVideoDuration,
@@ -68,43 +72,43 @@ export function ExtractionControls() {
     width: number;
     height: number;
   } | null>(null);
-  const [loadingMeta, setLoadingMeta] = useState(false);
+  const [metaError, setMetaError] = useState(false);
+  const [warning, setWarning] = useState<string | null>(null);
 
-  // Detect metadata when video is set
+  // Clear stale metadata when the selected file changes (adjust-state-during-render).
+  const [prevFile, setPrevFile] = useState(videoFile);
+  if (videoFile !== prevFile) {
+    setPrevFile(videoFile);
+    setMetadata(null);
+    setMetaError(false);
+  }
+
+  // Detect metadata when a video is set. All state updates happen in async callbacks.
   React.useEffect(() => {
-    if (!videoFile) {
-      // Defer to avoid calling setState synchronously in effect body
-      const clear = () => setMetadata(null);
-      clear();
-      return;
-    }
-
+    if (!videoFile) return;
     let cancelled = false;
-    const setMeta = () => setLoadingMeta(true);
-    setMeta();
     detectVideoMetadata(videoFile.file)
       .then((meta) => {
         if (!cancelled) setMetadata(meta);
       })
       .catch((err) => {
         console.error("Metadata detection failed:", err);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingMeta(false);
+        if (!cancelled) setMetaError(true);
       });
-
     return () => {
       cancelled = true;
     };
   }, [videoFile]);
 
-  const estimatedFrames = metadata
-    ? Math.ceil(metadata.duration * videoFps)
-    : 0;
+  const loadingMeta = !!videoFile && !metadata && !metaError;
+  const estimatedFrames = metadata ? Math.ceil(metadata.duration * videoFps) : 0;
 
   const handleStartExtraction = async () => {
     if (!videoFile) return;
 
+    const controller = new AbortController();
+    setExtractionAbort(controller);
+    setWarning(null);
     setExtractionStatus("extracting");
     setExtractionProgress(0);
     setFramesExtracted(0);
@@ -113,53 +117,61 @@ export function ExtractionControls() {
     setExtractionMethod("canvas");
 
     try {
-      await extractFramesSequential(videoFile.file, videoFps, {
-        onProgress: (extracted, total) => {
-          setFramesExtracted(extracted);
-          setEstimatedTotalFrames(total);
-          setExtractionProgress((extracted / total) * 100);
+      await extractFramesSequential(
+        videoFile.file,
+        videoFps,
+        {
+          onProgress: (extracted, total) => {
+            setFramesExtracted(extracted);
+            setEstimatedTotalFrames(total);
+            setExtractionProgress(total > 0 ? (extracted / total) * 100 : 0);
+          },
+          onStatusChange: (status) => {
+            setExtractionStatus(status as ExtractionStatus);
+          },
+          onFrameExtracted: (index) => {
+            setFramesExtracted(index + 1);
+          },
+          onSessionCreated: (session) => {
+            setCurrentSession(session);
+            setTotalFrames(session.frameCount);
+            setVideoDuration(session.duration);
+            setVideoWidth(session.width);
+            setVideoHeight(session.height);
+            setVideoFps(session.fps);
+          },
+          onError: (error) => {
+            setExtractionError(error);
+            setExtractionStatus("error");
+          },
+          onComplete: (_sessionId, frameCount) => {
+            setExtractionStatus("completed");
+            setTotalFrames(frameCount);
+          },
+          onWarning: (message) => setWarning(message),
         },
-        onStatusChange: (status) => {
-          setExtractionStatus(status as any);
-        },
-        onFrameExtracted: (index) => {
-          setFramesExtracted(index + 1);
-        },
-        onSessionCreated: (session) => {
-          setCurrentSession(session);
-          setTotalFrames(session.frameCount);
-          setVideoDuration(session.duration);
-          setVideoWidth(session.width);
-          setVideoHeight(session.height);
-          setVideoFps(session.fps);
-        },
-        onError: (error) => {
-          setExtractionError(error);
-          setExtractionStatus("error");
-        },
-        onComplete: (_sessionId, frameCount) => {
-          setExtractionStatus("completed");
-          setTotalFrames(frameCount);
-        },
-      });
-    } catch (error) {
-      setExtractionError(
-        error instanceof Error ? error.message : "Extraction failed"
+        controller.signal,
       );
+    } catch (error) {
+      setExtractionError(error instanceof Error ? error.message : "Extraction failed");
       setExtractionStatus("error");
+    } finally {
+      setExtractionAbort(null);
     }
   };
 
   if (!videoFile) return null;
 
+  const isExtracting = extractionStatus === "extracting";
   const canStart =
-    videoFile &&
-    metadata &&
-    (extractionStatus === "idle" || extractionStatus === "error");
+    !!videoFile &&
+    !!metadata &&
+    (extractionStatus === "idle" ||
+      extractionStatus === "error" ||
+      extractionStatus === "cancelled");
 
   return (
     <div className="space-y-4">
-      {/* Video metadata display */}
       {metadata && (
         <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 bg-muted/50 rounded-lg border border-border">
           <Badge variant="secondary" className="gap-1.5 font-normal">
@@ -180,7 +192,13 @@ export function ExtractionControls() {
         </div>
       )}
 
-      {/* FPS selector & extraction settings */}
+      {warning && (
+        <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <span>{warning}</span>
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row items-start sm:items-end gap-4">
         <div className="flex flex-col gap-1.5 flex-1 w-full sm:w-auto">
           <Label className="text-sm font-medium flex items-center gap-1.5">
@@ -191,8 +209,9 @@ export function ExtractionControls() {
               </TooltipTrigger>
               <TooltipContent side="top" className="max-w-xs">
                 <p className="text-xs">
-                  Higher FPS captures more frames per second but takes longer
-                  to process. Choose based on your needs.
+                  Frames are sampled at this rate (independent of the source video&apos;s
+                  true frame rate). Higher rates capture more frames but take longer and
+                  use more storage.
                 </p>
               </TooltipContent>
             </Tooltip>
@@ -200,7 +219,7 @@ export function ExtractionControls() {
           <Select
             value={String(videoFps)}
             onValueChange={(val) => setVideoFps(Number(val))}
-            disabled={extractionStatus === "extracting"}
+            disabled={isExtracting}
           >
             <SelectTrigger className="w-full sm:w-[240px]">
               <SelectValue />
@@ -222,29 +241,29 @@ export function ExtractionControls() {
           </Select>
         </div>
 
-        <Button
-          onClick={handleStartExtraction}
-          disabled={!canStart}
-          className="w-full sm:w-auto gap-2"
-          size="lg"
-        >
-          {extractionStatus === "extracting" ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin" />
-              Extracting...
-            </>
-          ) : (
-            <>
-              <Play className="w-4 h-4" />
-              {metadata
-                ? `Extract ~${estimatedFrames.toLocaleString()} Frames`
-                : "Start Extraction"}
-            </>
-          )}
-        </Button>
+        {isExtracting ? (
+          <Button
+            onClick={cancelExtraction}
+            variant="destructive"
+            className="w-full sm:w-auto gap-2"
+            size="lg"
+          >
+            <X className="w-4 h-4" />
+            Cancel
+          </Button>
+        ) : (
+          <Button
+            onClick={handleStartExtraction}
+            disabled={!canStart}
+            className="w-full sm:w-auto gap-2"
+            size="lg"
+          >
+            <Play className="w-4 h-4" />
+            {metadata ? `Extract ~${estimatedFrames.toLocaleString()} Frames` : "Start Extraction"}
+          </Button>
+        )}
       </div>
 
-      {/* Estimated info */}
       {metadata && extractionStatus === "idle" && (
         <div className="flex items-center gap-4 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
@@ -252,10 +271,7 @@ export function ExtractionControls() {
             Using Canvas API (browser-native)
           </span>
           <span>•</span>
-          <span>
-            ~{estimatedFrames.toLocaleString()} frames will be stored in
-            IndexedDB
-          </span>
+          <span>~{estimatedFrames.toLocaleString()} frames will be stored in IndexedDB</span>
         </div>
       )}
     </div>
