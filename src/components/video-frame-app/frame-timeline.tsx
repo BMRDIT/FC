@@ -8,7 +8,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   SafmnEngine,
   isWebGPUSupported,
-  computeTileGrid,
 } from "@/lib/safmn-engine";
 import { Sparkles, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 
@@ -357,6 +356,17 @@ export function FrameTimeline() {
     const endIdx = startIdx + 300;
     setVisibleRange({ start: startIdx, end: Math.min(endIdx, totalFrames) });
   }, [totalFrames]);
+
+  // Dispose shared engine on unmount to free GPU resources.
+  useEffect(() => {
+    return () => {
+      if (sharedEngine) {
+        sharedEngine.dispose().catch(() => {});
+        sharedEngine = null;
+        engineInitPromise = null;
+      }
+    };
+  }, []);
 
   if (extractionStatus === "idle" || totalFrames === 0) {
     return null;

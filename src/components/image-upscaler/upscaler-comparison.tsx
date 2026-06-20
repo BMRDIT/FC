@@ -101,7 +101,7 @@ export function UpscalerComparison() {
             src={imageFile.objectUrl}
             alt="Original"
             className="absolute inset-0 h-full w-full object-contain"
-            style={{ width: `${(100 / sliderPosition) * 100}%` }}
+            style={{ width: `${(100 / Math.max(0.1, sliderPosition)) * 100}%` }}
             draggable={false}
           />
         </div>

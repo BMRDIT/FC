@@ -55,7 +55,6 @@ export function ImageUpscalerApp() {
   } = useUpscalerStore();
 
   const engineRef = useRef<SafmnEngine | null>(null);
-  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Clean up engine and object URLs on unmount.
   useEffect(() => {
@@ -146,7 +145,6 @@ export function ImageUpscalerApp() {
       });
 
       const sourceCanvas = loadImageToCanvas(img);
-      sourceCanvasRef.current = sourceCanvas;
 
       // Pre-compute tile grid to show total count immediately.
       const tiles = computeTileGrid(sourceCanvas.width, sourceCanvas.height);
@@ -229,6 +227,11 @@ export function ImageUpscalerApp() {
     if (engineRef.current) {
       engineRef.current.dispose().catch(() => {});
       engineRef.current = null;
+    }
+    // Revoke the object URL to prevent memory leaks.
+    const { imageFile: currentFile } = useUpscalerStore.getState();
+    if (currentFile?.objectUrl) {
+      URL.revokeObjectURL(currentFile.objectUrl);
     }
     resetAll();
   }, [resetAll]);

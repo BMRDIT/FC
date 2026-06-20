@@ -23,7 +23,6 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 
 export function FrameViewer() {
   const {
@@ -68,8 +67,7 @@ export function FrameViewer() {
 
   // The upscaled image belongs to the currently selected frame
   const hasUpscaledForCurrentFrame =
-    upscaledImageUrl && upscaledImageFrameIndex === selectedFrameIndex;
-  const currentFrameUpscaleStatus = upscaleStatusMap[selectedFrameIndex] || "idle";
+    !!(upscaledImageUrl && upscaledImageFrameIndex === selectedFrameIndex);
   const isCurrentFrameUpscaling = upscalingFrameIndex === selectedFrameIndex;
 
   // Cleanup function for URLs
